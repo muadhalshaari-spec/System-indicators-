@@ -1,0 +1,903 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © muadh_alshaari
+
+//@version=6
+indicator("Ultimate Order Flow, VWAP & Liquidation Heatmap", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500, max_bars_back=5000)
+
+// ==============================================================================
+// GROUPS & INPUTS (FROM SCRIPT 1)
+// ==============================================================================
+grp1 = "Order Flow Settings"
+ltf = input.timeframe("1", title="Intrabar Resolution", group=grp1, tooltip="Lower timeframe used to calculate buy/sell volume split.")
+lookbackDays = input.int(7, title="Macro Lookback Period (Days)", group=grp1, minval=1)
+volMultiplier = input.float(1.5, title="Absorption Vol Multiplier", group=grp1, tooltip="Volume threshold to detect absorption")
+
+grp2 = "Imbalance Zone Settings"
+imbalanceMult = input.float(3.0, title="Imbalance Threshold (3.0 = 300%)", group=grp2)
+imbVolMultiplier = input.float(2.5, title="Imbalance Zone Vol Multiplier", group=grp2, tooltip="Strict volume requirement for high-volume areas only")
+zoneLookbackHours = input.float(1.0, title="Zone Expiration Lookback (Hours)", group=grp2, tooltip="Deletes extending zones older than this period")
+
+grp3 = "Missed Auction Settings"
+showMissedAuctions = input.bool(true, title="Show Missed Auction Zones", group=grp3, tooltip="Toggle green/red highlight areas for missed auctions")
+missedVolMult = input.float(1.0, title="Missed Auction Vol Threshold", group=grp3, tooltip="1.0 = 100% of average volume. Filters out low-volume poor highs/lows.")
+
+// LuxAlgo Groups & Inputs
+string G_VWAP = "VWAP Settings"
+string G_STOP = "Stop Zones (Pivots)"
+string G_VP   = "Volume Profile & Stop Zones"
+string G_IFVG = "Inversion Fair Value Gaps (IFVGs)"
+
+vwapAnchor     = input.string("Session", "VWAP Anchor", options = ["Session", "Week", "Month", "Year"], group = G_VWAP)
+stdDevMult     = input.float(2.0, "Std. Dev Multiplier", minval = 0.5, step = 0.1, group = G_VWAP)
+
+pivotLookback  = input.int(50, "Pivot Lookback (Stop Zones)", minval = 10, group = G_STOP)
+maxActiveLines = input.int(10, "Max Active Lines", minval = 1, maxval = 50, group = G_STOP)
+
+vpRows         = input.int(50, "Profile Rows", minval = 10, maxval = 100, group = G_VP)
+vpWidth        = input.int(30, "Profile Max Width (Bars)", minval = 5, group = G_VP)
+vpOffset       = input.int(10, "Profile Right Offset", minval = 0, group = G_VP)
+sessionAnchor  = input.string("1800-1801", "Anchor Time Range (HHMM-HHMM)", group = G_VP)
+sessionTz      = input.string("GMT-4", "Timezone", options = ["GMT-5", "GMT-4", "UTC"], group = G_VP)
+stopThreshold  = input.float(1.5, "Stop Zone Volume Multiplier", minval = 1.0, step = 0.1, group = G_VP)
+
+showIFVG       = input.bool(false, "Show IFVGs", group = G_IFVG)
+ifvgVolFilter  = input.float(1.2, "IFVG Volatility Filter", minval = 0.5, step = 0.1, group = G_IFVG)
+ifvgHistory    = input.int(5, "Max Active IFVGs", minval = 1, maxval = 20, group = G_IFVG)
+
+// ==============================================================================
+// 1. INTRABAR VOLUME SPLIT (FOOTPRINT PROXY)
+// ==============================================================================
+[ltfOpen, ltfClose, ltfVol] = request.security_lower_tf(syminfo.tickerid, ltf, [open, close, volume])
+
+float buyVol = 0.0
+float sellVol = 0.0
+
+if array.size(ltfClose) > 0
+    for i = 0 to array.size(ltfClose) - 1
+        float c = array.get(ltfClose, i)
+        float o = array.get(ltfOpen, i)
+        float v = array.get(ltfVol, i)
+        
+        if c > o
+            buyVol += v
+        else if c < o
+            sellVol += v
+        else
+            buyVol += (v / 2)
+            sellVol += (v / 2)
+
+float totalVol = buyVol + sellVol
+float barDelta = buyVol - sellVol
+float barDeltaPct = totalVol > 0 ? (barDelta / totalVol) * 100 : 0
+
+// ==============================================================================
+// 2. ABSORPTION & MISSED AUCTION LOGIC
+// ==============================================================================
+float avgVol = ta.sma(totalVol, 20)
+bool isHighVol = totalVol > (avgVol * volMultiplier)
+bool isExtremeVol = totalVol > (avgVol * imbVolMultiplier) 
+bool isMissedVol = totalVol > (avgVol * missedVolMult)
+
+bool bullishWick = (close - low) > (high - close) and close >= open
+bool bearishWick = (high - close) > (close - low) and close <= open
+
+bool buyAbsorption = isHighVol and (sellVol > buyVol) and bullishWick 
+bool sellAbsorption = isHighVol and (buyVol > sellVol) and bearishWick
+
+bool missedBuyAuction = (close == high) and (buyVol > 0) and (sellVol > 0) and isMissedVol
+bool missedSellAuction = (close == low) and (sellVol > 0) and (buyVol > 0) and isMissedVol
+
+float currentBuyAbsPct = buyAbsorption and totalVol > 0 ? (sellVol / totalVol) * 100 : 0.0
+float currentSellAbsPct = sellAbsorption and totalVol > 0 ? (buyVol / totalVol) * 100 : 0.0
+float currentBarTrappedBuyVol = buyAbsorption ? sellVol : 0.0
+float currentBarTrappedSellVol = sellAbsorption ? buyVol : 0.0
+
+// ==============================================================================
+// 3. 300% VOLUME IMBALANCE LOGIC
+// ==============================================================================
+float safeSellVol = sellVol == 0 ? 1 : sellVol
+float safeBuyVol = buyVol == 0 ? 1 : buyVol
+
+bool isBuyImbalance = isExtremeVol and (close > open) and (buyVol / safeSellVol >= imbalanceMult)
+bool isSellImbalance = isExtremeVol and (close < open) and (sellVol / safeBuyVol >= imbalanceMult)
+
+// ==============================================================================
+// 4. 7-DAY ROLLING METRICS ACCUMULATOR
+// ==============================================================================
+var array<float> deltaArray = array.new<float>()
+var array<int>   timeArray  = array.new<int>()
+var array<float> volArray   = array.new<float>()
+var array<float> trapBuyArray = array.new<float>()
+var array<float> trapSellArray = array.new<float>()
+
+array.push(deltaArray, barDelta)
+array.push(timeArray, time)
+array.push(volArray, totalVol)
+array.push(trapBuyArray, currentBarTrappedBuyVol)
+array.push(trapSellArray, currentBarTrappedSellVol)
+
+int msMacroLookback = lookbackDays * 86400000
+while array.size(timeArray) > 0 and (time - array.get(timeArray, 0)) > msMacroLookback
+    array.shift(deltaArray)
+    array.shift(timeArray)
+    array.shift(volArray)
+    array.shift(trapBuyArray)
+    array.shift(trapSellArray)
+
+float rollingTotalVol = 0.0
+float rollingTotalTrapBuy = 0.0
+float rollingTotalTrapSell = 0.0
+
+if array.size(deltaArray) > 0
+    for i = 0 to array.size(deltaArray) - 1
+        rollingTotalVol += array.get(volArray, i)
+        rollingTotalTrapBuy += array.get(trapBuyArray, i)
+        rollingTotalTrapSell += array.get(trapSellArray, i)
+
+float rollingBuyAbsRate = rollingTotalVol > 0 ? (rollingTotalTrapBuy / rollingTotalVol) * 100 : 0
+float rollingSellAbsRate = rollingTotalVol > 0 ? (rollingTotalTrapSell / rollingTotalVol) * 100 : 0
+
+// ==============================================================================
+// 5. VISUAL PLOTTING (ZONES, BUBBLES, CROSSES - SCRIPT 1)
+// ==============================================================================
+var array<box> imbBoxes = array.new<box>()
+var array<int> imbBoxTimes = array.new<int>()
+
+if isBuyImbalance
+    box b = box.new(left=bar_index, top=high, bottom=low, right=bar_index + 1, extend=extend.right, border_color=color.new(color.lime, 40), bgcolor=color.new(color.lime, 90), text="Buy Imb Zone")
+    array.push(imbBoxes, b)
+    array.push(imbBoxTimes, time)
+
+if isSellImbalance
+    box b = box.new(left=bar_index, top=high, bottom=low, right=bar_index + 1, extend=extend.right, border_color=color.new(color.red, 40), bgcolor=color.new(color.red, 90), text="Sell Imb Zone")
+    array.push(imbBoxes, b)
+    array.push(imbBoxTimes, time)
+
+if showMissedAuctions and missedBuyAuction
+    box maB = box.new(left=bar_index, top=high, bottom=open, right=bar_index + 1, extend=extend.right, border_color=color.new(color.green, 40), bgcolor=color.new(color.green, 85), text="Missed Buy (Poor High)")
+    array.push(imbBoxes, maB)
+    array.push(imbBoxTimes, time)
+
+if showMissedAuctions and missedSellAuction
+    box maS = box.new(left=bar_index, top=open, bottom=low, right=bar_index + 1, extend=extend.right, border_color=color.new(color.red, 40), bgcolor=color.new(color.red, 85), text="Missed Sell (Poor Low)")
+    array.push(imbBoxes, maS)
+    array.push(imbBoxTimes, time)
+
+int msZoneLookback = int(zoneLookbackHours * 3600000)
+while array.size(imbBoxTimes) > 0 and (time - array.get(imbBoxTimes, 0)) > msZoneLookback
+    array.shift(imbBoxTimes) 
+    box oldBox = array.shift(imbBoxes) 
+    box.delete(oldBox) 
+
+if buyAbsorption
+    label.new(bar_index, low, text=str.tostring(currentBuyAbsPct, "#.#") + "%", yloc=yloc.belowbar, style=label.style_circle, color=color.new(#08d371, 30), textcolor=color.rgb(196, 185, 24), size=size.normal, tooltip="Aggressive Selling Absorbed")
+
+if sellAbsorption
+    label.new(bar_index, high, text=str.tostring(currentSellAbsPct, "#.#") + "%", yloc=yloc.abovebar, style=label.style_circle, color=color.new(color.red, 30), textcolor=color.rgb(195, 17, 17), size=size.normal, tooltip="Aggressive Buying Absorbed")
+
+plotshape(showMissedAuctions and missedBuyAuction, title="Missed Buy Cross", style=shape.xcross, location=location.abovebar, color=color.new(color.fuchsia, 0), size=size.tiny)
+plotshape(showMissedAuctions and missedSellAuction, title="Missed Sell Cross", style=shape.xcross, location=location.belowbar, color=color.new(color.aqua, 0), size=size.tiny)
+
+// ==============================================================================
+// 6. LUXALGO VWAP, PIVOTS, IFVG & VOLUME PROFILE LOGIC
+// ==============================================================================
+isNewVwapPeriod = switch vwapAnchor
+    "Session" => timeframe.change("D")
+    "Week"    => timeframe.change("W")
+    "Month"   => timeframe.change("M")
+    "Year"    => timeframe.change("12M")
+    => false
+
+[vValue, vUpper, vLower] = ta.vwap(hlc3, isNewVwapPeriod, stdDevMult)
+
+ph = ta.pivothigh(high, pivotLookback, pivotLookback)
+pl = ta.pivotlow(low, pivotLookback, pivotLookback)
+
+var line[] upperLines = array.new_line()
+var line[] lowerLines = array.new_line()
+
+if not na(ph)
+    newLine = line.new(bar_index - pivotLookback, ph, bar_index, ph, color = color.new(#f23645, 60), style = line.style_dashed)
+    array.unshift(upperLines, newLine)
+    if array.size(upperLines) > maxActiveLines
+        line.delete(array.pop(upperLines))
+
+if not na(pl)
+    newLine = line.new(bar_index - pivotLookback, pl, bar_index, pl, color = color.new(#089981, 60), style = line.style_dashed)
+    array.unshift(lowerLines, newLine)
+    if array.size(lowerLines) > maxActiveLines
+        line.delete(array.pop(lowerLines))
+
+avgVol20 = ta.sma(volume, 20)
+var bool stopTriggeredUpper = false
+var bool stopTriggeredLower = false
+stopTriggeredUpper := false
+stopTriggeredLower := false
+
+if array.size(upperLines) > 0
+    for i = array.size(upperLines) - 1 to 0
+        l = array.get(upperLines, i)
+        if high >= line.get_y1(l)
+            if volume > avgVol20 * 1.2
+                stopTriggeredUpper := true
+            line.set_x2(l, bar_index)
+            array.remove(upperLines, i)
+        else
+            line.set_x2(l, bar_index)
+
+if array.size(lowerLines) > 0
+    for i = array.size(lowerLines) - 1 to 0
+        l = array.get(lowerLines, i)
+        if low <= line.get_y1(l)
+            if volume > avgVol20 * 1.2
+                stopTriggeredLower := true
+            line.set_x2(l, bar_index)
+            array.remove(lowerLines, i)
+        else
+            line.set_x2(l, bar_index)
+
+avgBody = ta.sma(math.abs(close - open), 50)
+volatilityValid = math.abs(close[1] - open[1]) > avgBody * ifvgVolFilter
+
+bearFVG = volatilityValid and high < low[2]
+bullFVG = volatilityValid and low > high[2]
+
+var float[] activeBearFvgTop = array.new_float()
+var float[] activeBearFvgBtm = array.new_float()
+var int[]   activeBearFvgBar = array.new_int()
+
+var float[] activeBullFvgTop = array.new_float()
+var float[] activeBullFvgBtm = array.new_float()
+var int[]   activeBullFvgBar = array.new_int()
+
+if showIFVG
+    if bearFVG
+        array.unshift(activeBearFvgTop, low[2])
+        array.unshift(activeBearFvgBtm, high)
+        array.unshift(activeBearFvgBar, bar_index[1])
+    if bullFVG
+        array.unshift(activeBullFvgTop, low)
+        array.unshift(activeBullFvgBtm, high[2])
+        array.unshift(activeBullFvgBar, bar_index[1])
+
+var box[]  ifvgBoxes  = array.new_box()
+var label[] ifvgLabels = array.new_label()
+var bool[]  ifvgIsBull = array.new_bool()
+
+if showIFVG
+    if array.size(activeBearFvgTop) > 0
+        for i = array.size(activeBearFvgTop) - 1 to 0
+            top = array.get(activeBearFvgTop, i)
+            btm = array.get(activeBearFvgBtm, i)
+            if close > top
+                startBar = array.get(activeBearFvgBar, i)
+                newBox   = box.new(startBar, top, bar_index + 10, btm, bgcolor = color.new(#089981, 85), border_color = color.new(#089981, 60))
+                newLabel = label.new(bar_index, (top + btm) / 2, "IFVG", color = #00000000, textcolor = #089981, style = label.style_label_center, size = size.small)
+                array.unshift(ifvgBoxes, newBox)
+                array.unshift(ifvgLabels, newLabel)
+                array.unshift(ifvgIsBull, true)
+                array.remove(activeBearFvgTop, i)
+                array.remove(activeBearFvgBtm, i)
+                array.remove(activeBearFvgBar, i)
+                if array.size(ifvgBoxes) > ifvgHistory
+                    box.delete(array.pop(ifvgBoxes))
+                    label.delete(array.pop(ifvgLabels))
+                    array.pop(ifvgIsBull)
+
+    if array.size(activeBullFvgTop) > 0
+        for i = array.size(activeBullFvgTop) - 1 to 0
+            top = array.get(activeBullFvgTop, i)
+            btm = array.get(activeBullFvgBtm, i)
+            if close < btm
+                startBar = array.get(activeBullFvgBar, i)
+                newBox   = box.new(startBar, top, bar_index + 10, btm, bgcolor = color.new(#f23645, 85), border_color = color.new(#f23645, 60))
+                newLabel = label.new(bar_index, (top + btm) / 2, "IFVG", color = #00000000, textcolor = #f23645, style = label.style_label_center, size = size.small)
+                array.unshift(ifvgBoxes, newBox)
+                array.unshift(ifvgLabels, newLabel)
+                array.unshift(ifvgIsBull, false)
+                array.remove(activeBullFvgTop, i)
+                array.remove(activeBullFvgBtm, i)
+                array.remove(activeBullFvgBar, i)
+                if array.size(ifvgBoxes) > ifvgHistory
+                    box.delete(array.pop(ifvgBoxes))
+                    label.delete(array.pop(ifvgLabels))
+                    array.pop(ifvgIsBull)
+
+if array.size(ifvgBoxes) > 0
+    for i = array.size(ifvgBoxes) - 1 to 0
+        b      = array.get(ifvgBoxes, i)
+        l      = array.get(ifvgLabels, i)
+        isBull = array.get(ifvgIsBull, i)
+        top    = box.get_top(b)
+        btm    = box.get_bottom(b)
+        
+        mitigated = isBull ? close < btm : close > top
+        
+        if mitigated
+            box.delete(b)
+            label.delete(l)
+            array.remove(ifvgBoxes, i)
+            array.remove(ifvgLabels, i)
+            array.remove(ifvgIsBull, i)
+        else
+            if bar_index < box.get_right(b)
+                box.set_right(b, bar_index + 5)
+
+t = time(timeframe.period, sessionAnchor, sessionTz)
+isAnchorBar = not na(t) and na(t[1])
+var float[] sessionPrices = array.new_float()
+var float[] sessionVolumes = array.new_float()
+var float[] sessionBuyVols = array.new_float()
+var float[] sessionSellVols = array.new_float()
+
+if isAnchorBar
+    array.clear(sessionPrices)
+    array.clear(sessionVolumes)
+    array.clear(sessionBuyVols)
+    array.clear(sessionSellVols)
+
+float range_val = math.max(high - low, syminfo.mintick)
+float bVol = volume * (close - low) / range_val
+float sVol = volume * (high - close) / range_val
+
+array.push(sessionPrices, close)
+array.push(sessionVolumes, volume)
+array.push(sessionBuyVols, bVol)
+array.push(sessionSellVols, sVol)
+
+bgcolor(isAnchorBar ? color.new(color.yellow, 80) : na)
+
+var box[]   profileBoxes  = array.new_box()
+var label[] profileLabels = array.new_label()
+
+if barstate.islast and array.size(sessionPrices) > 0
+    float sHigh = array.get(sessionPrices, 0)
+    float sLow  = array.get(sessionPrices, 0)
+    for p in sessionPrices
+        sHigh := math.max(sHigh, p)
+        sLow  := math.min(sLow, p)
+    
+    float[] binVols = array.new_float(vpRows, 0.0)
+    float[] binBuyVols = array.new_float(vpRows, 0.0)
+    float[] binSellVols = array.new_float(vpRows, 0.0)
+    float bSize = (sHigh - sLow) / vpRows
+    
+    if bSize > 0
+        for i = 0 to array.size(sessionPrices) - 1
+            float p = array.get(sessionPrices, i)
+            float v = array.get(sessionVolumes, i)
+            float bv = array.get(sessionBuyVols, i)
+            float sv = array.get(sessionSellVols, i)
+            int bIdx = math.min(vpRows - 1, math.max(0, math.floor((p - sLow) / bSize)))
+            array.set(binVols, bIdx, array.get(binVols, bIdx) + v)
+            array.set(binBuyVols, bIdx, array.get(binBuyVols, bIdx) + bv)
+            array.set(binSellVols, bIdx, array.get(binSellVols, bIdx) + sv)
+        
+        if array.size(profileBoxes) > 0
+            for i = 0 to array.size(profileBoxes) - 1
+                box.delete(array.get(profileBoxes, i))
+            array.clear(profileBoxes)
+        if array.size(profileLabels) > 0
+            for i = 0 to array.size(profileLabels) - 1
+                label.delete(array.get(profileLabels, i))
+            array.clear(profileLabels)
+        
+        maxV   = 0.0
+        totalV = 0.0
+        pIdx   = 0
+        for i = 0 to vpRows - 1
+            v = array.get(binVols, i)
+            totalV += v
+            if v > maxV
+                maxV := v
+                pIdx := i
+        
+        avgV = totalV / vpRows
+        for i = 0 to vpRows - 1
+            v = array.get(binVols, i)
+            if v > 0
+                nW = (v / maxV) * vpWidth
+                isStop = v > avgV * stopThreshold
+                binColor = i == pIdx ? color.new(#FFEB3B, 10) : isStop ? color.new(#ff9800, 30) : color.new(#5b9cf6, 60)
+                
+                t_box = sLow + (i + 1) * bSize
+                b_box = sLow + i * bSize
+                l_box = bar_index + vpOffset
+                r_box = l_box + math.round(nW)
+                array.push(profileBoxes, box.new(l_box, t_box, r_box, b_box, border_color = color.new(chart.bg_color, 100), bgcolor = binColor))
+                
+                if isStop or i == pIdx
+                    diffMult = v / avgV
+                    bv = array.get(binBuyVols, i)
+                    sv = array.get(binSellVols, i)
+                    
+                    y_center = (t_box + b_box) / 2
+                    multColor = i == pIdx ? #FFEB3B : #ff9800
+                    
+                    multTxt = str.format("{0,number,#.#}x", diffMult)
+                    multLabel = label.new(r_box, y_center, multTxt, xloc.bar_index, yloc.price, color.new(chart.bg_color, 100), label.style_label_left, multColor, size.tiny)
+                    array.push(profileLabels, multLabel)
+                    
+                    sideTxt = bv > sv ? "B" : "S"
+                    sideColor = bv > sv ? #089981 : #f23645
+                    
+                    sideLabel = label.new(r_box + 3, y_center, sideTxt, xloc.bar_index, yloc.price, color.new(chart.bg_color, 100), label.style_label_left, sideColor, size.tiny)
+                    array.push(profileLabels, sideLabel)
+
+// ==============================================================================
+// 7. LIQUIDATION HEATMAP INPUTS & HELPERS (FROM SCRIPT 2)
+// ==============================================================================
+groupSrc = "Source (Liq Heatmap)"
+srcMode = input.string("OI", "Source Mode", options=["AUTO","VOL","OI"], group=groupSrc)
+oiOverride = input.string("", "OI Symbol Override", group=groupSrc)
+autoOiExchange = input.string("BINANCE", "Auto OI Exchange", options=["BINANCE","BYBIT"], group=groupSrc)
+autoOiQuote = input.string("USDT", "Auto OI Quote", options=["USDT","USD"], group=groupSrc)
+oiAttribution = input.string("Aggressive", "OI Attribution Mode", options=["Aggressive","Conservative"], group=groupSrc)
+
+groupEvent = "Event (Spike) Filter"
+lookback  = input.int(100, "Spike Lookback", minval=20, maxval=2000, group=groupEvent)
+sens      = input.int(10, "Sensitivity (1=more, 20=less)", minval=1, maxval=20, group=groupEvent)
+spikeMethod = input.string("ZScore", "Spike Method", options=["ZScore","EMA ZScore","Average Multiple"], group=groupEvent)
+useWicks  = input.bool(true, "Use high/low for touch test", group=groupEvent)
+minBarGap = input.int(0, "Min bars between events (0=off)", minval=0, maxval=500, group=groupEvent)
+
+groupLevels = "Liquidation Levels (bins)"
+refPL = input.string("close", "Reference Price", options=["open","close","oc2","hl2","hlc3","ohlc4","hlcc4"], group=groupLevels)
+lev1  = input.int(100, "Leverage 1", minval=0, group=groupLevels)
+lev2  = input.int(50,  "Leverage 2", minval=0, group=groupLevels)
+lev3  = input.int(25,  "Leverage 3", minval=0, group=groupLevels)
+
+scaleTicks = input.int(600, "Bin Scale (ticks)", minval=10, maxval=50000, group=groupLevels)
+extendBars = input.int(100, "Extend (bars)", minval=10, maxval=2000, group=groupLevels)
+storage    = input.int(240, "Max active bins per side", minval=20, maxval=260, group=groupLevels)
+dispPct = input.float(20, "Dispersion (%)", minval=0, maxval=100, step=1, group=groupLevels) / 100.0
+
+localOnly = input.bool(false, "Keep only local range bins", group=groupLevels)
+localBars = input.int(250, "Local range lookback", minval=50, maxval=2000, group=groupLevels)
+
+evictionMode = input.string("Weakest", "Eviction Mode", options=["Oldest","Weakest","Farthest"], group=groupLevels)
+weightMode = input.string("Raw", "Weight Normalization", options=["Raw","Relative to Average","Positive ZScore"], group=groupLevels)
+
+groupVis = "Visual (Liq Heatmap)"
+topColor = input.color(color.rgb(187, 255, 0), "High density", group=groupVis)
+btmColor = input.color(#228B22, "Low density", group=groupVis)
+frozenAlpha = input.int(80, "Frozen alpha (0..100)", minval=0, maxval=100, group=groupVis)
+showLegend = input.bool(false, "Show legend", group=groupVis)
+showSpikeMarker = input.bool(false, "Show spike marker (debug)", group=groupVis)
+
+f_gSRC(_s) =>
+    float out = close
+    if _s == "open"
+        out := open
+    else if _s == "close"
+        out := close
+    else if _s == "hl2"
+        out := hl2
+    else if _s == "oc2"
+        out := math.avg(open, close)
+    else if _s == "hlc3"
+        out := hlc3
+    else if _s == "ohlc4"
+        out := ohlc4
+    else
+        out := hlcc4
+    out
+
+f_liq_price(_ref, _lev, _isLongSide) =>
+    float out = na
+    if _lev > 0
+        if _isLongSide
+            out := _ref * (1.0 - 1.0 / _lev)
+        else
+            out := _ref * (1.0 + 1.0 / _lev)
+    out
+
+f_step() =>
+    syminfo.mintick * scaleTicks
+
+f_bin_id(_price) =>
+    step = f_step()
+    int(math.floor(_price / step))
+
+f_bin_extremes_from_id(_id) =>
+    step = f_step()
+    btm = float(_id) * step
+    top = btm + step
+    [top, btm]
+
+f_grad(_w, _maxW) =>
+    color out = color.new(btmColor, 85)
+    if _maxW > 0
+        out := color.from_gradient(_w, 0.0, _maxW, color.new(btmColor, 85), color.new(topColor, 15))
+    out
+
+f_touches(_top, _btm) =>
+    hi = useWicks ? high : close
+    lo = useWicks ? low  : close
+    hi > _btm and lo < _top
+
+f_maxW(_wArr) =>
+    float mx = 0.0
+    if array.size(_wArr) > 0
+        for i = 0 to array.size(_wArr) - 1
+            mx := math.max(mx, array.get(_wArr, i))
+    mx
+
+f_find_min_w_idx(_wArr) =>
+    int idx = 0
+    if array.size(_wArr) > 0
+        float mn = array.get(_wArr, 0)
+        if array.size(_wArr) > 1
+            for i = 1 to array.size(_wArr) - 1
+                v = array.get(_wArr, i)
+                if v < mn
+                    mn := v
+                    idx := i
+    idx
+
+f_find_farthest_idx(_bArr) =>
+    int idx = 0
+    float far = -1.0
+    if array.size(_bArr) > 0
+        for i = 0 to array.size(_bArr) - 1
+            bb = array.get(_bArr, i)
+            mid = (box.get_top(bb) + box.get_bottom(bb)) * 0.5
+            d = math.abs(mid - close)
+            if d > far
+                far := d
+                idx := i
+    idx
+
+f_pick_eviction_idx(_wArr, _bArr) =>
+    int idx = 0
+    if evictionMode == "Oldest"
+        idx := 0
+    else if evictionMode == "Weakest"
+        idx := f_find_min_w_idx(_wArr)
+    else
+        idx := f_find_farthest_idx(_bArr)
+    idx
+
+f_update_colors(_wArr, _bArr) =>
+    if array.size(_wArr) > 0 and array.size(_bArr) > 0
+        mx = f_maxW(_wArr)
+        for i = 0 to array.size(_wArr) - 1
+            ww = array.get(_wArr, i)
+            bb = array.get(_bArr, i)
+            col = f_grad(ww, mx)
+            box.set_bgcolor(bb, col)
+            box.set_border_color(bb, col)
+
+f_add_bin(_ids, _wArr, _bArr, _binId, _weight) =>
+    int changed = 0
+    if _weight > 0 and not na(_binId)
+        idx = array.indexof(_ids, _binId)
+        [top, btm] = f_bin_extremes_from_id(_binId)
+
+        if idx >= 0
+            newW = array.get(_wArr, idx) + _weight
+            array.set(_wArr, idx, newW)
+            bb = array.get(_bArr, idx)
+            box.set_right(bb, bar_index + extendBars)
+            changed := 1
+        else
+            if array.size(_ids) >= storage
+                killIdx = f_pick_eviction_idx(_wArr, _bArr)
+                old = array.get(_bArr, killIdx)
+                box.delete(old)
+                array.remove(_ids, killIdx)
+                array.remove(_wArr, killIdx)
+                array.remove(_bArr, killIdx)
+
+            col = f_grad(_weight, _weight)
+            bb = box.new(bar_index, top, bar_index + extendBars, btm, border_color=col, bgcolor=col, border_width=1)
+            array.push(_ids, _binId)
+            array.push(_wArr, _weight)
+            array.push(_bArr, bb)
+            changed := 1
+    changed
+
+f_freeze_touched(_ids, _wArr, _bArr) =>
+    int frozenN = 0
+    if array.size(_ids) > 0 and array.size(_bArr) > 0
+        for i = array.size(_ids) - 1 to 0 by 1
+            bb  = array.get(_bArr, i)
+            top = box.get_top(bb)
+            btm = box.get_bottom(bb)
+            if f_touches(top, btm)
+                box.set_right(bb, bar_index)
+                box.set_bgcolor(bb, color.new(chart.fg_color, frozenAlpha))
+                box.set_border_color(bb, color.new(chart.fg_color, frozenAlpha))
+                box.set_border_style(bb, line.style_dotted)
+
+                array.remove(_ids, i)
+                array.remove(_wArr, i)
+                array.remove(_bArr, i)
+                frozenN += 1
+    frozenN
+
+f_extend_active(_bArr) =>
+    if array.size(_bArr) > 0
+        for i = 0 to array.size(_bArr) - 1
+            bb = array.get(_bArr, i)
+            box.set_right(bb, bar_index + extendBars)
+
+f_local_trim(_ids, _wArr, _bArr, _hi, _lo) =>
+    int changed = 0
+    if localOnly and array.size(_ids) > 0 and array.size(_bArr) > 0
+        for i = array.size(_ids) - 1 to 0 by 1
+            bb  = array.get(_bArr, i)
+            top = box.get_top(bb)
+            btm = box.get_bottom(bb)
+            outside = top < _lo or btm > _hi
+            if outside
+                box.delete(bb)
+                array.remove(_ids, i)
+                array.remove(_wArr, i)
+                array.remove(_bArr, i)
+                changed := 1
+    changed
+
+base = syminfo.basecurrency
+autoOiSym = autoOiExchange + ":" + base + autoOiQuote + ".P_OI"
+oiSym = str.length(oiOverride) > 0 ? oiOverride : autoOiSym
+
+oiClose = request.security(oiSym, timeframe.period, close, ignore_invalid_symbol=true)
+oiDelta = oiClose - nz(oiClose[1])
+haveOI  = not na(oiClose) and not na(oiDelta)
+
+refP = f_gSRC(refPL)
+
+bool useOI = false
+if srcMode == "OI"
+    useOI := true
+else if srcMode == "VOL"
+    useOI := false
+else
+    useOI := haveOI
+
+rawStream = useOI ? oiDelta : volume
+streamAbs = math.abs(rawStream)
+
+thr = 1.0 + (sens - 1) * (2.0 / 19.0)
+
+muSma = ta.sma(streamAbs, lookback)
+muEma = ta.ema(streamAbs, lookback)
+sd    = ta.stdev(streamAbs, lookback)
+
+zSma = sd > 0 ? (streamAbs - muSma) / sd : 0.0
+zEma = sd > 0 ? (streamAbs - muEma) / sd : 0.0
+avgMult = muSma > 0 ? streamAbs / muSma : 0.0
+
+float metric = na
+if spikeMethod == "ZScore"
+    metric := zSma
+else if spikeMethod == "EMA ZScore"
+    metric := zEma
+else
+    metric := avgMult
+
+bool isMetricSpike = false
+if spikeMethod == "Average Multiple"
+    isMetricSpike := metric > (1.0 + thr * 0.5)
+else
+    isMetricSpike := metric > thr
+
+var int lastEventBar = na
+canEvent = na(lastEventBar) ? true : (minBarGap <= 0 ? true : (bar_index - lastEventBar >= minBarGap))
+
+isSpike = canEvent and isMetricSpike
+if isSpike
+    lastEventBar := bar_index
+
+float normW = na
+if weightMode == "Raw"
+    normW := streamAbs
+else if weightMode == "Relative to Average"
+    normW := muSma > 0 ? streamAbs / muSma : 0.0
+else
+    normW := math.max(0.0, zSma)
+
+w = na(normW) ? 0.0 : normW
+
+float longW = 0.0
+float shortW = 0.0
+
+if useOI
+    priceUp = close >= close[1]
+    oiUp = oiDelta >= 0
+
+    if oiUp
+        if priceUp
+            longW := w * (1.0 - dispPct)
+            shortW := w * dispPct
+        else
+            shortW := w * (1.0 - dispPct)
+            longW := w * dispPct
+    else
+        if oiAttribution == "Aggressive"
+            if priceUp
+                shortW := w * 0.50
+                longW := w * dispPct * 0.25
+            else
+                longW := w * 0.50
+                shortW := w * dispPct * 0.25
+        else
+            longW := 0.0
+            shortW := 0.0
+else
+    isUp = close >= open
+    mainFrac = 1.0 - dispPct
+    altFrac  = dispPct
+    if isUp
+        longW := w * mainFrac
+        shortW := w * altFrac
+    else
+        longW := w * altFrac
+        shortW := w * mainFrac
+
+var int[]   L_ids = array.new_int()
+var float[] L_w   = array.new_float()
+var box[]   L_box = array.new_box()
+
+var int[]   S_ids = array.new_int()
+var float[] S_w   = array.new_float()
+var box[]   S_box = array.new_box()
+
+var int frozenCount = 0
+var bool dirtyL = false
+var bool dirtyS = false
+
+if isSpike
+    lp1 = f_liq_price(refP, lev1, true)
+    lp2 = f_liq_price(refP, lev2, true)
+    lp3 = f_liq_price(refP, lev3, true)
+
+    sp1 = f_liq_price(refP, lev1, false)
+    sp2 = f_liq_price(refP, lev2, false)
+    sp3 = f_liq_price(refP, lev3, false)
+
+    levCount = (lev1 > 0 ? 1 : 0) + (lev2 > 0 ? 1 : 0) + (lev3 > 0 ? 1 : 0)
+
+    perLevLong  = levCount > 0 ? (longW / levCount) : 0.0
+    perLevShort = levCount > 0 ? (shortW / levCount) : 0.0
+
+    if lev1 > 0
+        id1 = f_bin_id(lp1)
+        add1 = f_add_bin(L_ids, L_w, L_box, id1, perLevLong)
+        if add1 > 0
+            dirtyL := true
+
+        id2 = f_bin_id(sp1)
+        add2 = f_add_bin(S_ids, S_w, S_box, id2, perLevShort)
+        if add2 > 0
+            dirtyS := true
+
+    if lev2 > 0
+        id3 = f_bin_id(lp2)
+        add3 = f_add_bin(L_ids, L_w, L_box, id3, perLevLong)
+        if add3 > 0
+            dirtyL := true
+
+        id4 = f_bin_id(sp2)
+        add4 = f_add_bin(S_ids, S_w, S_box, id4, perLevShort)
+        if add4 > 0
+            dirtyS := true
+
+    if lev3 > 0
+        id5 = f_bin_id(lp3)
+        add5 = f_add_bin(L_ids, L_w, L_box, id5, perLevLong)
+        if add5 > 0
+            dirtyL := true
+
+        id6 = f_bin_id(sp3)
+        add6 = f_add_bin(S_ids, S_w, S_box, id6, perLevShort)
+        if add6 > 0
+            dirtyS := true
+
+f_extend_active(L_box)
+f_extend_active(S_box)
+
+frL = f_freeze_touched(L_ids, L_w, L_box)
+frS = f_freeze_touched(S_ids, S_w, S_box)
+
+if frL > 0
+    dirtyL := true
+if frS > 0
+    dirtyS := true
+
+frozenCount += frL + frS
+
+global_hi = ta.highest(high, localBars)
+global_lo = ta.lowest(low, localBars)
+
+trimL = f_local_trim(L_ids, L_w, L_box, global_hi, global_lo)
+trimS = f_local_trim(S_ids, S_w, S_box, global_hi, global_lo)
+
+if trimL > 0
+    dirtyL := true
+if trimS > 0
+    dirtyS := true
+
+if dirtyL
+    f_update_colors(L_w, L_box)
+    dirtyL := false
+
+if dirtyS
+    f_update_colors(S_w, S_box)
+    dirtyS := false
+
+if showLegend and barstate.islast
+    var table leg = table.new(position.middle_right, 1, 12)
+    table.clear(leg, 0, 0, 0, 11)
+
+    lmx = f_maxW(L_w)
+    smx = f_maxW(S_w)
+    mx = math.max(lmx, smx)
+
+    modeTxt = useOI ? "OI" : "VOL"
+
+    table.cell(leg, 0, 0, "Est. Liq Map (" + modeTxt + ")", text_color=chart.fg_color, bgcolor=color.new(color.black, 100))
+    table.cell(leg, 0, 1, "Spike > " + str.tostring(thr, format.mintick), text_color=color.new(chart.fg_color, 20), bgcolor=color.new(color.black, 100))
+    table.cell(leg, 0, 2, "Long bins: " + str.tostring(array.size(L_ids)), text_color=chart.fg_color, bgcolor=color.new(color.black, 100))
+    table.cell(leg, 0, 3, "Short bins: " + str.tostring(array.size(S_ids)), text_color=chart.fg_color, bgcolor=color.new(color.black, 100))
+    table.cell(leg, 0, 4, "Frozen: " + str.tostring(frozenCount), text_color=chart.fg_color, bgcolor=color.new(color.black, 100))
+
+    for i = 0 to 6
+        wv = mx * (6 - i) / 6.0
+        col = f_grad(wv, mx)
+        labelTxt = ""
+        if i == 0
+            labelTxt := "MAX"
+        else if i == 6
+            labelTxt := "MIN"
+        table.cell(leg, 0, i + 5, labelTxt, bgcolor=col, text_color=chart.fg_color)
+
+plotchar(showSpikeMarker and isSpike ? 1 : na, title="Spike", char="•", location=location.top, size=size.tiny, color=color.new(chart.fg_color, 0))
+
+// ==============================================================================
+// 8. PLOTS & DASHBOARDS
+// ==============================================================================
+plot(vValue, "VWAP", color.new(chart.fg_color, 50))
+pUp = plot(vUpper, "Upper Band", color.new(#f23645, 0))
+pLo = plot(vLower, "Lower Band", color.new(#089981, 0))
+fill(pUp, plot(vValue), vUpper, vValue, color.new(#f23645, 90), color.new(#f23645, 100))
+fill(pLo, plot(vValue), vLower, vValue, color.new(#089981, 90), color.new(#089981, 100))
+
+plotshape(stopTriggeredUpper, "Stops Triggered High", shape.circle, location.abovebar, color.new(#f23645, 50), size = size.tiny)
+plotshape(stopTriggeredLower, "Stops Triggered Low", shape.circle, location.belowbar, color.new(#089981, 50), size = size.tiny)
+
+var table macroTable = table.new(position.top_right, 2, 3, border_width=1, border_color=color.gray)
+if barstate.islast
+    table.cell(macroTable, 0, 0, str.tostring(lookbackDays) + "-Day Order Flow", text_color=color.white, bgcolor=color.gray)
+    table.cell(macroTable, 1, 0, "Absorption Rate", text_color=color.white, bgcolor=color.gray)
+    
+    table.cell(macroTable, 0, 1, "7D Buy Absorption", text_color=color.lime, bgcolor=color.black)
+    table.cell(macroTable, 1, 1, str.tostring(rollingBuyAbsRate, "#.##") + "%", text_color=color.lime, bgcolor=color.black)
+    
+    table.cell(macroTable, 0, 2, "7D Sell Absorption", text_color=color.red, bgcolor=color.black)
+    table.cell(macroTable, 1, 2, str.tostring(rollingSellAbsRate, "#.##") + "%", text_color=color.red, bgcolor=color.black)
+
+var table microTable = table.new(position.bottom_right, 2, 5, border_width=1, border_color=color.gray)
+
+string currentStatus = buyAbsorption ? "BULLISH (Absorbing Sells)" : sellAbsorption ? "BEARISH (Absorbing Buys)" : "Neutral"
+color statusColor = buyAbsorption ? color.lime : sellAbsorption ? color.red : color.silver
+
+string imbStatus = isBuyImbalance ? "Buy Imbalance (300%+)" : isSellImbalance ? "Sell Imbalance (300%+)" : "Balanced"
+color imbColor = isBuyImbalance ? color.lime : isSellImbalance ? color.red : color.silver
+
+if barstate.islast
+    table.cell(microTable, 0, 0, "Current Bar Data", text_color=color.white, bgcolor=color.gray)
+    table.cell(microTable, 1, 0, "Metrics", text_color=color.white, bgcolor=color.gray)
+    
+    table.cell(microTable, 0, 1, "Bar Buy Abs Pct", text_color=color.lime, bgcolor=color.black)
+    table.cell(microTable, 1, 1, str.tostring(currentBuyAbsPct, "#.##") + "%", text_color=color.lime, bgcolor=color.black)
+    
+    table.cell(microTable, 0, 2, "Bar Sell Abs Pct", text_color=color.red, bgcolor=color.black)
+    table.cell(microTable, 1, 2, str.tostring(currentSellAbsPct, "#.##") + "%", text_color=color.red, bgcolor=color.black)
+
+    table.cell(microTable, 0, 3, "Live Status", text_color=statusColor, bgcolor=color.black)
+    table.cell(microTable, 1, 3, currentStatus, text_color=statusColor, bgcolor=color.black)
+    
+    table.cell(microTable, 0, 4, "Order Flow State", text_color=imbColor, bgcolor=color.black)
+    table.cell(microTable, 1, 4, imbStatus, text_color=imbColor, bgcolor=color.black)

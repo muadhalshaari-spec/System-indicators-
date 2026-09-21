@@ -1,5 +1,0 @@
-//@version=6
-indicator("08 bollinger", overlay=true)
-length=input.int(14,"Length",minval=1)
-value=ta.ema(close,length)
-plot(value,"bollinger")

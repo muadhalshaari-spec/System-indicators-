@@ -1,5 +1,0 @@
-//@version=6
-indicator("22 break of structure", overlay=true)
-length=input.int(14,"Length",minval=1)
-value=ta.ema(close,length)
-plot(value,"break_of_structure")

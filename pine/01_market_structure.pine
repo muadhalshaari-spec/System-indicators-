@@ -1,5 +1,0 @@
-//@version=6
-indicator("01 Market Structure", overlay=true)
-ph=ta.pivothigh(high,5,5), pl=ta.pivotlow(low,5,5)
-plotshape(not na(ph),"Pivot High",shape.triangledown,location.abovebar,offset=-5)
-plotshape(not na(pl),"Pivot Low",shape.triangleup,location.belowbar,offset=-5)

@@ -1,5 +1,0 @@
-//@version=6
-indicator("06 atr", overlay=true)
-length=input.int(14,"Length",minval=1)
-value=ta.ema(close,length)
-plot(value,"atr")

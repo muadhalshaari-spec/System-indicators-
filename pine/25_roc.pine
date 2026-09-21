@@ -1,5 +1,0 @@
-//@version=6
-indicator("25 roc", overlay=true)
-length=input.int(14,"Length",minval=1)
-value=ta.ema(close,length)
-plot(value,"roc")

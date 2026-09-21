@@ -1,5 +1,0 @@
-//@version=6
-indicator("20 order block proxy", overlay=true)
-length=input.int(14,"Length",minval=1)
-value=ta.ema(close,length)
-plot(value,"order_block_proxy")

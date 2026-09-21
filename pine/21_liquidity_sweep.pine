@@ -1,0 +1,5 @@
+//@version=6
+indicator("21 liquidity sweep", overlay=true)
+length=input.int(14,"Length",minval=1)
+value=ta.ema(close,length)
+plot(value,"liquidity_sweep")

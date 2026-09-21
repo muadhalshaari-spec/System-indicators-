@@ -1,0 +1,5 @@
+//@version=6
+indicator("18 support resistance", overlay=true)
+length=input.int(14,"Length",minval=1)
+value=ta.ema(close,length)
+plot(value,"support_resistance")

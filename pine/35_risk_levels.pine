@@ -1,0 +1,5 @@
+//@version=6
+indicator("35 risk levels", overlay=true)
+length=input.int(14,"Length",minval=1)
+value=ta.ema(close,length)
+plot(value,"risk_levels")

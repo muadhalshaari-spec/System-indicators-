@@ -1,0 +1,325 @@
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Coyote AI Agent
+
+//@version=6
+
+indicator("Coyote OI Suite [Aggregated]", shorttitle="Aggregated OI ✦ AghaInvst", format=format.volume, max_bars_back=1000)
+
+import TradingView/ta/8 as tvta
+
+// ============================================
+// INPUT GROUPS
+// ============================================
+g_gen    = "General"
+g_src    = "Data Sources"
+g_thresh = "Thresholds"
+g_bar    = "Chart Bar Coloring"
+g_add    = "Additional Settings"
+g_scr    = "Screener"
+g_of     = "Order Flow Features"
+
+// ============================================
+// 1. GENERAL INPUTS
+// ============================================
+display     = input.string("OI Candles", "Display Mode", options=["OI Candles", "OI Delta"], group=g_gen, tooltip="OI Candles: OHLC candlestick of aggregated OI\nOI Delta: Bar chart of per-bar OI change")
+upColor     = input.color(#d1d4dc, "Normal Up Color    ", inline="gen_col", group=g_gen)
+downColor   = input.color(#9598a1, "Down", inline="gen_col", group=g_gen)
+bullHighlight = input.color(#a5d6a7, "Significant Up     ", inline="gen_sig", group=g_gen)
+bearHighlight = input.color(#fe5f6d, "Down", inline="gen_sig", group=g_gen)
+
+// ============================================
+// 2. DATA SOURCE INPUTS
+// ============================================
+useBinanceUSDT = input.bool(true, "Binance USDT.P_OI", inline="src1", group=g_src)
+useBinanceUSD  = input.bool(true, "Binance USD.P_OI", inline="src1", group=g_src)
+useBybitUSDT   = input.bool(true, "Bybit USDT.P_OI", inline="src2", group=g_src)
+useBybitUSD    = input.bool(true, "Bybit USD.P_OI", inline="src2", group=g_src)
+
+// ============================================
+// 3. THRESHOLD INPUTS
+// ============================================
+threshMult     = input.float(5.0, "Threshold Multiplier", minval=0.5, maxval=20.0, step=0.5, group=g_thresh, tooltip="Higher = fewer events highlighted. 5 is a good default for cutting noise.")
+threshLen      = input.int(300, "SMA Lookback", minval=50, maxval=1000, group=g_thresh, tooltip="Lookback for the adaptive threshold. 300 works across most timeframes.")
+showThreshLines = input.bool(false, "Show Threshold Lines", group=g_thresh)
+highlightLargeUp = input.bool(true, "Highlight Large OI Increase", group=g_thresh)
+highlightLargeDn = input.bool(true, "Highlight Large OI Decrease", group=g_thresh)
+
+// ============================================
+// 4. CHART BAR COLORING INPUTS
+// ============================================
+colorBars     = input.bool(true, "Enable Bar Coloring", group=g_bar, tooltip="Master toggle: colors main chart candles based on OI significance")
+dimNormal     = input.bool(true, "Dim Normal Bars", group=g_bar, tooltip="Grey out ALL normal bars — the signature look. Only significant OI events get color.")
+dimColor      = input.color(#363a45, "Dim Color", group=g_bar, tooltip="Dark grey for noise candles")
+barBullColor  = input.color(#a5d6a7, "Large OI Up  ", inline="bar_col", group=g_bar)
+barBearColor  = input.color(#fe5f6d, "Down", inline="bar_col", group=g_bar)
+useFuelColors = input.bool(true, "4-Color Fuel Mode", group=g_bar, tooltip="AGG LONGS=bright green, AGG SHORTS=bright red, REKT LONGS=muted red, REKT SHORTS=muted green")
+fuelAggLong   = input.color(#a5d6a7, "Agg Longs    ", inline="fuel1", group=g_bar)
+fuelAggShort  = input.color(#fe5f6d, "Agg Shorts", inline="fuel1", group=g_bar)
+fuelRektLong  = input.color(color.new(#ef5350, 60), "Rekt Longs   ", inline="fuel2", group=g_bar)
+fuelRektShort = input.color(color.new(#26a69a, 60), "Rekt Shorts", inline="fuel2", group=g_bar)
+
+// ============================================
+// 5. ADDITIONAL SETTINGS
+// ============================================
+showEMA  = input.bool(false, "Show OI EMA", inline="ema", group=g_add)
+emaLen   = input.int(50, "", inline="ema", group=g_add)
+emaColor = input.color(color.gray, "", inline="ema", group=g_add)
+
+// ============================================
+// 6. SCREENER INPUTS
+// ============================================
+showScreener    = input.bool(true, "Show Screener Table", group=g_scr)
+screenerLookback = input.int(200, "Lookback (bars)", minval=10, maxval=1000, group=g_scr)
+
+// ============================================
+// 7. ORDER FLOW FEATURE INPUTS
+// ============================================
+showSmartLabels  = input.bool(true, "Show Smart Bar Labels", group=g_of, tooltip="AGG LONGS, AGG SHORTS, REKT LONGS, REKT SHORTS labels on significant bars")
+showCascade      = input.bool(true, "Detect Liquidation Cascades", group=g_of, tooltip="2+ consecutive large OI decrease bars = liquidation cascade")
+cascadeLen       = input.int(2, "Cascade Threshold (bars)", minval=2, maxval=5, group=g_of)
+cascadeColor     = input.color(color.new(#ff1744, 70), "Cascade BG", group=g_of)
+showAbsorption   = input.bool(true, "Detect Absorption", group=g_of, tooltip="Large OI increase + small candle body = institutional accumulation")
+absBodyThreshold = input.float(0.3, "Absorption Max Body %", minval=0.1, maxval=0.5, step=0.05, group=g_of)
+
+// ============================================
+// DATA REQUESTS (4 sources, OHLC each)
+// ============================================
+base = syminfo.basecurrency
+
+// Binance USDT perpetual OI
+binUSDTticker = "BINANCE:" + base + "USDT.P_OI"
+[binUT_o, binUT_h, binUT_l, binUT_c] = request.security(binUSDTticker, timeframe.period, [open, high, low, close], ignore_invalid_symbol=true)
+
+// Binance USD (coin-margined) perpetual OI
+binUSDticker = "BINANCE:" + base + "USD.P_OI"
+[binU_o, binU_h, binU_l, binU_c] = request.security(binUSDticker, timeframe.period, [open, high, low, close], ignore_invalid_symbol=true)
+
+// Bybit USDT perpetual OI
+bybUSDTticker = "BYBIT:" + base + "USDT.P_OI"
+[bybUT_o, bybUT_h, bybUT_l, bybUT_c] = request.security(bybUSDTticker, timeframe.period, [open, high, low, close], ignore_invalid_symbol=true)
+
+// Bybit USD (inverse) perpetual OI
+bybUSDticker = "BYBIT:" + base + "USD.P_OI"
+[bybU_o, bybU_h, bybU_l, bybU_c] = request.security(bybUSDticker, timeframe.period, [open, high, low, close], ignore_invalid_symbol=true)
+
+// ============================================
+// OI AGGREGATION
+// ============================================
+// Note: USD/coin-margined OI is denominated in contracts (coin units).
+// Divide by close to normalize coin-margined to USDT-equivalent,
+// then multiply everything by price for USD display.
+
+// OHLC aggregation (raw contract values)
+float aggOpen  = (useBinanceUSDT ? nz(binUT_o) : 0) + (useBinanceUSD ? nz(binU_o) / close : 0) + (useBybitUSDT ? nz(bybUT_o) : 0) + (useBybitUSD ? nz(bybU_o) / close : 0)
+float aggHigh  = (useBinanceUSDT ? nz(binUT_h) : 0) + (useBinanceUSD ? nz(binU_h) / close : 0) + (useBybitUSDT ? nz(bybUT_h) : 0) + (useBybitUSD ? nz(bybU_h) / close : 0)
+float aggLow   = (useBinanceUSDT ? nz(binUT_l) : 0) + (useBinanceUSD ? nz(binU_l) / close : 0) + (useBybitUSDT ? nz(bybUT_l) : 0) + (useBybitUSD ? nz(bybU_l) / close : 0)
+float aggClose = (useBinanceUSDT ? nz(binUT_c) : 0) + (useBinanceUSD ? nz(binU_c) / close : 0) + (useBybitUSDT ? nz(bybUT_c) : 0) + (useBybitUSD ? nz(bybU_c) / close : 0)
+
+// USD-valued OHLC for display
+float oiO = aggOpen  * close
+float oiH = aggHigh  * close
+float oiL = aggLow   * close
+float oiC = aggClose * close
+
+// OI delta = intra-bar change (close - open), more accurate than close-close[1]
+float oiDelta = aggClose - aggOpen
+
+// ============================================
+// VOLUME DELTA (Real buy/sell classification)
+// ============================================
+// Uses TradingView's lower-TF trade classification — NOT candle color
+// This is what tells us WHO is buying/selling (shorts covering vs new longs)
+var lowerTF = switch
+    timeframe.isseconds  => "1S"
+    timeframe.isintraday => "1"
+    timeframe.isdaily    => "5"
+    => "60"
+
+[deltaOpen, deltaHigh, deltaLow, deltaClose] = tvta.requestVolumeDelta(lowerTF, "1D")
+float barDelta = nz(deltaClose) - nz(deltaOpen)
+
+// ============================================
+// THRESHOLD DETECTION
+// ============================================
+float posThreshold = ta.sma(oiDelta > 0 ? oiDelta : 0.0, threshLen) * threshMult
+float negThreshold = ta.sma(oiDelta < 0 ? oiDelta : 0.0, threshLen) * threshMult
+
+bool largeOIUp = oiDelta > posThreshold
+bool largeOIDn = oiDelta < negThreshold
+
+// ============================================
+// ORDER FLOW CLASSIFICATION (Delta-Based)
+// ============================================
+// Uses REAL volume delta instead of candle color — critical difference!
+// Candle color fails on SFP bars: sweep up + close down = bearish candle,
+// but delta is POSITIVE (shorts buying to cover). Delta tells the truth.
+//
+// Delta > 0 + OI up   = AGG LONGS    (new buyers entering)
+// Delta < 0 + OI up   = AGG SHORTS   (new sellers entering)
+// Delta < 0 + OI down = REKT LONGS   (longs forced out, selling)
+// Delta > 0 + OI down = REKT SHORTS  (shorts forced out, buying to cover)
+
+bool isAggLongs   = largeOIUp and barDelta > 0   // New fuel, bullish
+bool isAggShorts  = largeOIUp and barDelta < 0   // New fuel, bearish
+bool isRektLongs  = largeOIDn and barDelta < 0   // Longs liquidated (selling pressure)
+bool isRektShorts = largeOIDn and barDelta > 0   // Shorts liquidated (buying to cover)
+
+// ============================================
+// LIQUIDATION CASCADE DETECTION
+// ============================================
+var int cascadeCount = 0
+if largeOIDn
+    cascadeCount += 1
+else
+    cascadeCount := 0
+bool isCascade = cascadeCount >= cascadeLen
+
+// ============================================
+// ABSORPTION DETECTION
+// ============================================
+float bodyPct = high != low ? math.abs(close - open) / (high - low) : 0.5
+bool isSmallBody = bodyPct < absBodyThreshold
+bool isAbsorption = largeOIUp and isSmallBody
+
+// ============================================
+// OI PANE COLORING
+// ============================================
+bool isOICandles = display == "OI Candles"
+bool isOIDelta   = display == "OI Delta"
+
+// Candle mode colors
+color paneUpDown = oiC >= oiO ? upColor : downColor
+color paneCandleColor = paneUpDown
+if highlightLargeUp and largeOIUp
+    paneCandleColor := bullHighlight
+if highlightLargeDn and largeOIDn
+    paneCandleColor := bearHighlight
+
+// Delta mode colors
+color paneDeltaColor = oiDelta > 0 ? upColor : downColor
+if highlightLargeUp and largeOIUp
+    paneDeltaColor := bullHighlight
+if highlightLargeDn and largeOIDn
+    paneDeltaColor := bearHighlight
+
+// ============================================
+// PLOTTING — OI PANE
+// ============================================
+// OI Candles mode
+plotcandle(isOICandles ? oiO : na, isOICandles ? oiH : na, isOICandles ? oiL : na, isOICandles ? oiC : na, title="OI Candles", color=paneCandleColor, wickcolor=paneCandleColor, bordercolor=paneCandleColor)
+
+// OI Delta mode
+plot(isOIDelta ? oiDelta * close : na, title="OI Delta", style=plot.style_columns, color=paneDeltaColor)
+
+// OI EMA (candles mode only)
+plot(showEMA and isOICandles ? ta.ema(oiC, emaLen) : na, title="OI EMA", color=emaColor)
+
+// Threshold lines (delta mode only, since thresholds are in delta units)
+plot(showThreshLines and isOIDelta ? posThreshold * close : na, title="Pos Threshold", color=color.new(color.gray, 50), style=plot.style_line, linewidth=1)
+plot(showThreshLines and isOIDelta ? negThreshold * close : na, title="Neg Threshold", color=color.new(color.gray, 50), style=plot.style_line, linewidth=1)
+
+// ============================================
+// CHART BAR COLORING (Main Chart)
+// ============================================
+color barCol = na
+if colorBars
+    if useFuelColors and (largeOIUp or largeOIDn)
+        // 4-color fuel mode
+        if isAggLongs
+            barCol := fuelAggLong
+        else if isAggShorts
+            barCol := fuelAggShort
+        else if isRektLongs
+            barCol := fuelRektLong
+        else if isRektShorts
+            barCol := fuelRektShort
+    else if not useFuelColors and (largeOIUp or largeOIDn)
+        // 2-color simple mode
+        if largeOIUp
+            barCol := barBullColor
+        if largeOIDn
+            barCol := barBearColor
+    else if dimNormal
+        // Normal bar → dim grey
+        barCol := dimColor
+
+barcolor(barCol, title="OI Bar Coloring", editable=false)
+
+// Cascade background highlight
+bgcolor(showCascade and isCascade ? cascadeColor : na, title="Liquidation Cascade")
+
+// ============================================
+// SMART BAR LABELS (plotshape on OI pane)
+// ============================================
+plotshape(showSmartLabels and isAggLongs, title="Agg Longs Label", text="AGG\nLONGS", style=shape.labelup, location=location.bottom, color=color.new(#a5d6a7, 20), textcolor=color.white, size=size.tiny)
+plotshape(showSmartLabels and isAggShorts, title="Agg Shorts Label", text="AGG\nSHORTS", style=shape.labeldown, location=location.top, color=color.new(#fe5f6d, 20), textcolor=color.white, size=size.tiny)
+plotshape(showSmartLabels and isRektLongs, title="Rekt Longs Label", text="REKT\nLONGS", style=shape.labeldown, location=location.top, color=color.new(#ef5350, 60), textcolor=color.white, size=size.tiny)
+plotshape(showSmartLabels and isRektShorts, title="Rekt Shorts Label", text="REKT\nSHORTS", style=shape.labelup, location=location.bottom, color=color.new(#26a69a, 60), textcolor=color.white, size=size.tiny)
+
+// Absorption label (special — institutional signal)
+plotshape(showAbsorption and isAbsorption, title="Absorption Label", text="ABS", style=shape.diamond, location=location.top, color=color.new(#2196f3, 0), textcolor=color.new(#2196f3, 0), size=size.small)
+
+// ============================================
+// SCREENER TABLE
+// ============================================
+if showScreener and barstate.islast
+    var table scrTbl = table.new(position.bottom_right, 2, 7, border_width=1, frame_width=1, frame_color=color.new(#363a45, 0), border_color=color.new(#363a45, 0))
+
+    float rektLongs      = 0.0
+    float rektShorts     = 0.0
+    float aggLongs       = 0.0
+    float aggShorts      = 0.0
+
+    for i = 0 to screenerLookback - 1
+        if largeOIDn[i] and barDelta[i] < 0
+            rektLongs += math.abs(oiDelta[i] * close[i])
+        if largeOIDn[i] and barDelta[i] > 0
+            rektShorts += math.abs(oiDelta[i] * close[i])
+        if largeOIUp[i] and barDelta[i] > 0
+            aggLongs += math.abs(oiDelta[i] * close[i])
+        if largeOIUp[i] and barDelta[i] < 0
+            aggShorts += math.abs(oiDelta[i] * close[i])
+
+    color tblBg  = color.new(#1e222d, 10)
+    color tblHdr = color.new(#2a2e39, 0)
+    color tblTxt = #d1d4dc
+
+    // Header
+    table.cell(scrTbl, 0, 0, "Coyote OI", text_color=color.white, bgcolor=tblHdr, text_size=size.small, text_halign=text.align_center, text_font_family=font.family_monospace)
+    table.merge_cells(scrTbl, 0, 0, 1, 0)
+
+    // Lookback info
+    table.cell(scrTbl, 0, 1, "Lookback", text_color=tblTxt, bgcolor=tblBg, text_size=size.tiny, text_halign=text.align_left, text_font_family=font.family_monospace)
+    table.cell(scrTbl, 1, 1, str.tostring(screenerLookback) + " bars", text_color=tblTxt, bgcolor=tblBg, text_size=size.tiny, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // Total OI
+    table.cell(scrTbl, 0, 2, "Total OI", text_color=tblTxt, bgcolor=tblBg, text_size=size.small, text_halign=text.align_left, text_font_family=font.family_monospace)
+    table.cell(scrTbl, 1, 2, "$" + str.tostring(oiC, format.volume), text_color=tblTxt, bgcolor=tblBg, text_size=size.small, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // Rekt Longs
+    table.cell(scrTbl, 0, 3, "Rekt Longs", text_color=tblTxt, bgcolor=tblBg, text_size=size.small, text_halign=text.align_left, text_font_family=font.family_monospace)
+    table.cell(scrTbl, 1, 3, "$" + str.tostring(rektLongs, format.volume), text_color=#ef5350, bgcolor=tblBg, text_size=size.small, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // Rekt Shorts
+    table.cell(scrTbl, 0, 4, "Rekt Shorts", text_color=tblTxt, bgcolor=tblBg, text_size=size.small, text_halign=text.align_left, text_font_family=font.family_monospace)
+    table.cell(scrTbl, 1, 4, "$" + str.tostring(rektShorts, format.volume), text_color=#26a69a, bgcolor=tblBg, text_size=size.small, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // Aggressive Longs
+    table.cell(scrTbl, 0, 5, "Agg Longs", text_color=tblTxt, bgcolor=tblBg, text_size=size.small, text_halign=text.align_left, text_font_family=font.family_monospace)
+    table.cell(scrTbl, 1, 5, "$" + str.tostring(aggLongs, format.volume), text_color=#a5d6a7, bgcolor=tblBg, text_size=size.small, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // Aggressive Shorts
+    table.cell(scrTbl, 0, 6, "Agg Shorts", text_color=tblTxt, bgcolor=tblBg, text_size=size.small, text_halign=text.align_left, text_font_family=font.family_monospace)
+    table.cell(scrTbl, 1, 6, "$" + str.tostring(aggShorts, format.volume), text_color=#fe5f6d, bgcolor=tblBg, text_size=size.small, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+// ============================================
+// ALERT CONDITIONS
+// ============================================
+alertcondition(largeOIUp, title="Large OI Increase", message="LARGE OI INCREASE on {{ticker}} {{interval}} — new positions entering")
+alertcondition(largeOIDn, title="Large OI Decrease", message="LARGE OI DECREASE on {{ticker}} {{interval}} — positions closing/liquidated")
+alertcondition(isRektLongs, title="Rekt Longs", message="REKT LONGS on {{ticker}} {{interval}} — OI decrease + negative delta (longs forced out)")
+alertcondition(isRektShorts, title="Rekt Shorts", message="REKT SHORTS on {{ticker}} {{interval}} — OI decrease + positive delta (shorts buying to cover)")
+alertcondition(isAggLongs, title="Aggressive Longs", message="AGGRESSIVE LONGS on {{ticker}} {{interval}} — OI increase + positive delta (new longs entering)")
+alertcondition(isAggShorts, title="Aggressive Shorts", message="AGGRESSIVE SHORTS on {{ticker}} {{interval}} — OI increase + negative delta (new shorts entering)")
+alertcondition(isCascade, title="Liquidation Cascade", message="LIQUIDATION CASCADE on {{ticker}} {{interval}} — {{cascadeLen}}+ consecutive large OI decrease bars")
+alertcondition(isAbsorption, title="OI Absorption", message="ABSORPTION on {{ticker}} {{interval}} — large OI increase with small body (institutional accumulation)")

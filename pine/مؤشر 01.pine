@@ -1,0 +1,186 @@
+//@version=6
+
+indicator('Aggregated Open Interest', format = format.volume, dynamic_requests = true)
+
+// Input settings for enabling/disabling exchanges
+
+useBinance = input.bool(true, "Binance", group = "Exchanges")
+
+useBybit = input.bool(true, "Bybit", group = "Exchanges")
+
+useKraken = input.bool(true, "Kraken", group = "Exchanges")
+
+useMEXC = input.bool(true, "MEXC", group = "Exchanges")
+
+useBitget = input.bool(true, "Bitget", group = "Exchanges")
+
+useBingX = input.bool(true, "BingX", group = "Exchanges")
+
+useCoinbase = input.bool(true, "Coinbase", group = "Exchanges")
+
+useDeribit = input.bool(true, "Deribit", group = "Exchanges")
+
+useHTX = input.bool(true, "HTX", group = "Exchanges")
+
+useCryptoCom = input.bool(true, "Crypto.com", group = "Exchanges")
+
+// ATR Histogram Settings
+
+useATRHistogram = input.bool(false, "Use ATR Histogram", group = "ATR Histogram Settings", tooltip = "When enabled, displays Open Interest data as ATR histogram instead of candles to better visualize the rate of change")
+
+atrLength = input.int(title="ATR Length", defval=14, minval=1, group = "ATR Histogram Settings", active = useATRHistogram)
+
+atrSmoothing = input.string(title="ATR Smoothing", defval="EMA", options=["RMA", "SMA", "EMA", "WMA"], group = "ATR Histogram Settings", active = useATRHistogram)
+
+// ATR Moving Average Settings
+
+showATRMA = input.bool(false, "Show ATR Moving Average", group = "ATR Histogram Settings", tooltip = "When enabled, displays a moving average line over the ATR histogram", active = useATRHistogram)
+
+atrMALength = input.int(title="MA Length", defval=9, minval=1, group = "ATR Histogram Settings", active = useATRHistogram and showATRMA)
+
+atrMAType = input.string(title="MA Type", defval="EMA", options=["RMA", "SMA", "EMA", "WMA"], group = "ATR Histogram Settings", active = useATRHistogram and showATRMA)
+
+atrMAColor = input.color(title="MA Color", defval=color.yellow, group = "ATR Histogram Settings", active = useATRHistogram and showATRMA)
+
+// ATR Smoothing Function
+
+ma_function(source, length) =>
+
+	switch atrSmoothing
+
+		"RMA" => ta.rma(source, length)
+
+		"SMA" => ta.sma(source, length)
+
+		"EMA" => ta.ema(source, length)
+
+		=> ta.wma(source, length)
+
+// ATR Moving Average Function
+
+ma_function_atr(source, length) =>
+
+	switch atrMAType
+
+		"RMA" => ta.rma(source, length)
+
+		"SMA" => ta.sma(source, length)
+
+		"EMA" => ta.ema(source, length)
+
+		=> ta.wma(source, length)
+
+// Get the base ticker symbol
+
+baseTicker = syminfo.basecurrency
+
+// Function to get OI data from an exchange
+
+getOIData(exchange, ticker, useExchange) =>
+
+    if not useExchange
+
+        [na, na, na, na, false, na, false]
+
+    else
+
+        tickerOI = str.format('{0}:{1}_OI', exchange, ticker)
+
+        [oiOpen, oiHigh, oiLow, oiClose, oiColorCond] = if timeframe.isintraday
+
+            request.security(tickerOI, timeframe.period, [open, high, low, close, close > close[1]], ignore_invalid_symbol = true)
+
+        else
+
+            [na, na, na, na, false]
+
+        [oiCloseD, oiColorCondD] = request.security(tickerOI, "1D", [close, close > close[1]], ignore_invalid_symbol = true)
+
+        [oiOpen, oiHigh, oiLow, oiClose, oiColorCond, oiCloseD, oiColorCondD]
+
+// Get OI data from each exchange
+
+[binOiO, binOiH, binOiL, binOiC, binOiCC, binOiCD, binOiCCD] = getOIData("BINANCE", baseTicker + "USDT.P", useBinance)
+
+[bybitOiO, bybitOiH, bybitOiL, bybitOiC, bybitOiCC, bybitOiCD, bybitOiCCD] = getOIData("BYBIT", baseTicker + "USDT.P", useBybit)
+
+[krakenOiO, krakenOiH, krakenOiL, krakenOiC, krakenOiCC, krakenOiCD, krakenOiCCD] = getOIData("KRAKEN", baseTicker + "USDX2025", useKraken)
+
+[mexcOiO, mexcOiH, mexcOiL, mexcOiC, mexcOiCC, mexcOiCD, mexcOiCCD] = getOIData("MEXC", baseTicker + "USDT.P", useMEXC)
+
+[bitgetOiO, bitgetOiH, bitgetOiL, bitgetOiC, bitgetOiCC, bitgetOiCD, bitgetOiCCD] = getOIData("BITGET", baseTicker + "USDT.P", useBitget)
+
+[bingxOiO, bingxOiH, bingxOiL, bingxOiC, bingxOiCC, bingxOiCD, bingxOiCCD] = getOIData("BINGX", baseTicker + "USDT.P", useBingX)
+
+[cbOiO, cbOiH, cbOiL, cbOiC, cbOiCC, cbOiCD, cbOiCCD] = getOIData("COINBASE", baseTicker + "USDC.P", useCoinbase)
+
+[deribitOiO, deribitOiH, deribitOiL, deribitOiC, deribitOiCC, deribitOiCD, deribitOiCCD] = getOIData("DERIBIT", baseTicker + "USDC28X2025", useDeribit)
+
+[htxOiO, htxOiH, htxOiL, htxOiC, htxOiCC, htxOiCD, htxOiCCD] = getOIData("HTX", baseTicker + "USD26Z2025", useHTX)
+
+[cryptoComOiO, cryptoComOiH, cryptoComOiL, cryptoComOiC, cryptoComOiCC, cryptoComOiCD, cryptoComOiCCD] = getOIData("CRYPTOCOM", baseTicker + "USD28X2025", useCryptoCom)
+
+// Aggregate the data
+
+aggOiOpen = nz(binOiO) + nz(bybitOiO) + nz(krakenOiO) + nz(mexcOiO) + nz(bitgetOiO) + nz(bingxOiO) + nz(cbOiO) + nz(deribitOiO) + nz(htxOiO) + nz(cryptoComOiO)
+
+aggOiHigh = nz(binOiH) + nz(bybitOiH) + nz(krakenOiH) + nz(mexcOiH) + nz(bitgetOiH) + nz(bingxOiH) + nz(cbOiH) + nz(deribitOiH) + nz(htxOiH) + nz(cryptoComOiH)
+
+aggOiLow = nz(binOiL) + nz(bybitOiL) + nz(krakenOiL) + nz(mexcOiL) + nz(bitgetOiL) + nz(bingxOiL) + nz(cbOiL) + nz(deribitOiL) + nz(htxOiL) + nz(cryptoComOiL)
+
+aggOiClose = nz(binOiC) + nz(bybitOiC) + nz(krakenOiC) + nz(mexcOiC) + nz(bitgetOiC) + nz(bingxOiC) + nz(cbOiC) + nz(deribitOiC) + nz(htxOiC) + nz(cryptoComOiC)
+
+aggOiCloseD = nz(binOiCD) + nz(bybitOiCD) + nz(krakenOiCD) + nz(mexcOiCD) + nz(bitgetOiCD) + nz(bingxOiCD) + nz(cbOiCD) + nz(deribitOiCD) + nz(htxOiCD) + nz(cryptoComOiCD)
+
+// Determine color condition for aggregated data
+
+aggOiColorCond = aggOiClose > aggOiClose[1]
+
+aggOiColorCondD = aggOiCloseD > aggOiCloseD[1]
+
+// Check if we have intraday data
+
+var hasIntraday = false
+
+if not na(aggOiClose) and aggOiClose > 0
+
+    hasIntraday := true
+
+// Check if any data is available
+
+hasAnyData = not na(aggOiClose) or not na(aggOiCloseD)
+
+if barstate.islastconfirmedhistory and not hasAnyData
+
+    runtime.error(str.format('No Open Interest data found for {0} across selected exchanges.', baseTicker))
+
+// Calculate True Range and ATR for histogram mode
+
+trueRange = math.max(aggOiHigh - aggOiLow, math.max(math.abs(aggOiHigh - aggOiClose[1]), math.abs(aggOiLow - aggOiClose[1])))
+
+atrValue = useATRHistogram ? ma_function(trueRange, atrLength) : na
+
+// Calculate ATR Moving Average
+
+atrMAValue = useATRHistogram and showATRMA ? ma_function_atr(atrValue, atrMALength) : na
+
+// Determine color for plots
+
+openInterestColor = aggOiColorCond ? color.teal : color.red
+
+// Plot the aggregated data
+
+plot(hasIntraday ? na : aggOiCloseD, 'Aggregated Open Interest', aggOiColorCondD ? color.teal : color.red, style = plot.style_stepline, linewidth = 4)
+
+// Plot ATR histogram when enabled
+
+plot(useATRHistogram and hasIntraday ? atrValue : na, 'ATR Histogram', color = openInterestColor, style = plot.style_histogram, linewidth = 2)
+
+// Plot ATR Moving Average when enabled
+
+plot(useATRHistogram and showATRMA and hasIntraday ? atrMAValue : na, 'ATR Moving Average', color = atrMAColor, style = plot.style_line, linewidth = 2)
+
+// Plot candles when ATR histogram is disabled
+
+plotcandle(useATRHistogram ? na : aggOiOpen, useATRHistogram ? na : aggOiHigh, useATRHistogram ? na : aggOiLow, useATRHistogram ? na : aggOiClose, 'Aggregated Open Interest', color = openInterestColor, wickcolor = openInterestColor, bordercolor = openInterestColor)
+

@@ -1,0 +1,965 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © colicoid
+
+//@version=6
+indicator('CVD Divergence Insights', overlay = false, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+import TradingView/ta/8 as tvTa
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ DATA COLLECTION ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+dataGroup = "Data Collection"
+
+anchorInput = input.timeframe("", "Anchor period", tooltip="Timeframe for CVD reset. Empty = chart timeframe (recommended for smooth per-bar delta)", group=dataGroup)
+
+useFootprintInput = input.bool(false, "Use Footprint Data (Premium+)", tooltip="Enable to use TradingView's native footprint data for more precise CVD, delta, and POC calculations.\n\nRequires Premium or Ultimate plan. Leave OFF on lower-tier plans — enabling this on an unsupported plan will cause a script error.\n\nWhen disabled, the indicator uses the standard lower-timeframe CVD calculation which works on all plans.", group=dataGroup)
+
+lowerTimeframeTooltip = "Override the automatic lower timeframe used for the legacy CVD calculation, Spike Profiles, and Big Trades spatial distribution.\n\nThis does not affect footprint data when 'Use Footprint Data' is enabled.\n\nHigher timeframes provide more historical data, but the data will be less precise."
+useCustomTimeframeInput = input.bool(false, "Use custom timeframe", tooltip=lowerTimeframeTooltip, group=dataGroup)
+lowerTimeframeInput = input.timeframe("1", "Custom timeframe", tooltip="Specify which lower timeframe to use when 'Use custom timeframe' is enabled", group=dataGroup)
+
+showInfoInput = input.bool(true, "Show timeframe info", tooltip="Display lower timeframe and data availability status", group=dataGroup)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ MOVING AVERAGE ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+maGroup = "Moving Average"
+maLengthInput = input.int(14, minval=1, title="MA Length", tooltip="Set the length of the Moving Average.\n\nLower values (5–10) = more responsive, more noise.\nHigher values (14–30) = smoother, more lag.\n\nThis is used for smoothing both price and CVD before the divergence oscillator is calculated.", group=maGroup)
+maTypeInput = input.string("EMA", "MA Type", options=["SMA", "EMA", "WMA", "RMA", "HMA", "DEMA", "TEMA", "ZLEMA", "LSMA", "SMMA", "ALMA", "SWMA"], tooltip="Type of Moving Average to calculate:\n• SMA: Simple Moving Average\n• EMA: Exponential Moving Average\n• WMA: Weighted Moving Average\n• RMA: Rolling Moving Average (Wilder's)\n• HMA: Hull Moving Average\n• DEMA: Double Exponential Moving Average\n• TEMA: Triple Exponential Moving Average\n• ZLEMA: Zero Lag Exponential Moving Average\n• LSMA: Least Squares Moving Average\n• SMMA: Smoothed Moving Average\n• ALMA: Arnaud Legoux Moving Average\n• SWMA: Symmetrically Weighted Moving Average", group=maGroup)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ OSCILLATOR ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+oscGroup = "Oscillator"
+useVolumeWeighting = input.bool(true, "Volume Weighted?", tooltip="When enabled, the oscillator is scaled by relative volume.\n\nThis emphasizes divergences that occur on higher-than-normal volume and suppresses low-volume noise.\nHelps you focus on high-conviction pressure imbalances.\n\nNote: Spike detection always uses volume weighting regardless of this setting, because spikes must be significant to be meaningful.", group=oscGroup)
+oscLookback = input.int(50, minval=1, title="Lookback", tooltip="Lookback period used for:\n• Volume normalization — determines what counts as 'normal' volume\n• Spike detection — the baseline for calculating standard deviation\n\nHigher values = more stable reference, fewer false spikes.\nDefault: 50.", group=oscGroup)
+divergenceSpikeMultiplier = input.float(2.0, title="Divergence Spike Threshold (StdDev)", step=0.1, tooltip="Controls how extreme a divergence must be to trigger a spike dot.\n\nUses standard deviations from the mean. Lower values = more sensitive (more dots).\nHigher values = only the most extreme divergences get flagged.\n\nDefault: 2.0 (≈ top 5% of readings).", group=oscGroup)
+signalLength = input.int(5, title="Signal Line Length", tooltip="A short EMA of the oscillator to help track momentum shifts.\n\nHidden by default. Enable it in the style settings if you want a signal crossover layer.\nDefault length: 5.", group=oscGroup)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ COLOR & DISPLAY ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+colorGroup = "Color & Display"
+bullOscColor = input.color(color.new(color.green, 60), "Bullish Divergence", tooltip="Color of the oscillator area when CVD normalized value exceeds price normalized value.\n\nThis shows aggressive buying pressure that isn't translating into proportional price movement — bulls are being absorbed by passive sellers.\n\nNote: This is a series color (changes per bar), so it can only be configured here in Inputs, not in the Style tab.", group=colorGroup)
+bearOscColor = input.color(color.new(color.red, 60), "Bearish Divergence", tooltip="Color of the oscillator area when price normalized value exceeds CVD normalized value.\n\nThis shows aggressive selling pressure that isn't translating into proportional price movement — bears are being absorbed by passive buyers.\n\nNote: This is a series color (changes per bar), so it can only be configured here in Inputs, not in the Style tab.", group=colorGroup)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ ABSORPTION CLOUD ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+cloudGroup = "Absorption Cloud"
+showCloud = input.bool(false, "Show Absorption Cloud", tooltip="Displays the Insights oscillator as a cloud on the price chart.\n\nThe cloud is formed by two lines:\n• Price Line — the smoothed, normalized price mapped back to price space\n• Pressure Line — the smoothed, normalized CVD mapped to price space\n\nThe gap between them IS the Insights oscillator, rendered spatially.\n\nGreen cloud = CVD pressure exceeds price result (aggressive buying absorbed / bearish divergence)\nRed cloud = price result exceeds CVD pressure (aggressive selling absorbed / bullish divergence)\nThin/no cloud = harmony (flat Insights = clean swing territory)\nCloud flip = resolution of tension (where CSBs tend to appear)", group=cloudGroup)
+cloudScaleFactor = input.float(1.0, "Cloud Scale", minval=0.1, maxval=5.0, step=0.1, tooltip="Controls how wide the cloud appears on the chart.\n\nHigher values = wider, more visible cloud.\nLower values = tighter cloud hugging the price MA.\n\n1.0 = maps z-scores directly to ATR units.\nDefault: 1.0", group=cloudGroup)
+cloudAtrLength = input.int(20, "ATR Length", minval=5, maxval=200, tooltip="ATR period used to scale the cloud to price space.\n\nThe cloud width adapts to the asset's volatility — wider on volatile assets, tighter on calm ones.\n\nDefault: 20", group=cloudGroup)
+cloudBullColor = input.color(color.new(color.green, 90), "Bullish Cloud", tooltip="Cloud color when CVD normalized value is above price normalized value.\n\nThis indicates bearish divergence — aggressive sellers are being absorbed.\nBullish implication: passive buyers are in control.", group=cloudGroup)
+cloudBearColor = input.color(color.new(color.red, 90), "Bearish Cloud", tooltip="Cloud color when price normalized value is above CVD normalized value.\n\nThis indicates bullish divergence — aggressive buyers are being absorbed.\nBearish implication: passive sellers are in control.", group=cloudGroup)
+cloudLineColor = input.color(color.new(color.gray, 50), "Line Color", tooltip="Color of the dashed cloud edge lines.\n\nThese lines trace the Price and Pressure boundaries of the cloud.", group=cloudGroup)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ EFFORT SCORE ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+effortGroup = "Effort & Efficiency"
+showEffortScore = input.bool(false, "Show Effort & Efficiency", tooltip="Displays two numbers per bar below the candles on the price chart.\n\nLine 1 — Effort Score (0–100)\nHow much aggressive energy was deployed on this bar. Based on volume-weighted delta: the bar's net aggressive pressure (CVD delta) scaled by how unusual the bar's total volume is relative to recent bars.\n\nThe color tells you who was aggressive:\n  Green number = bulls were the dominant aggressors\n  Red number = bears were the dominant aggressors\nThe higher the number, the more effort was spent.\n\nLine 2 — Efficiency Ratio (%)\nHow effectively that effort translated into price movement in the intended direction.\n• Negative = effort backfired — price moved against the aggressors (divergence / absorption)\n• 0% = effort produced no price movement\n• Below 100% = effort partially absorbed (some resistance)\n• Around 100% = effort and result are proportional\n• Above 100% = ease of movement (low resistance, passive flow)\n\nHow to read them together:\n• High effort + negative efficiency = classic divergence, absorption in action\n• High effort + low efficiency = resistance / BRE territory\n• High effort + high efficiency = strong directional conviction\n• Declining effort + high efficiency = continuation getting easier (clean swing)", group=effortGroup)
+effortLookback = input.int(500, "Lookback", minval=10, maxval=500, tooltip="Number of bars used to rank the current bar's effort against.\n\nThe score is a percentile rank: 50 means median effort, 90 means more effort than 90% of recent bars.\n\nDefault: 500.", group=effortGroup)
+effortMinDisplay = input.int(50, "Min Score to Display", minval=0, maxval=99, tooltip="Only show the score label when the absolute effort exceeds this threshold.\n\nReduces visual clutter by hiding low-effort bars.\n0 = show all bars. 50 = show only above-average effort.\n\nDefault: 50.", group=effortGroup)
+effortLabelSize = input.string("small", "Label Size", options=["tiny", "small", "normal"], tooltip="Size of the effort score labels.", group=effortGroup)
+effortBullColor = input.color(color.green, "Bull Effort Color", tooltip="Color of effort/efficiency labels when bulls were the dominant aggressors (positive delta).\n\nNote: These labels use series colors (direction changes per bar), so they can only be configured here in Inputs, not in the Style tab.", group=effortGroup)
+effortBearColor = input.color(color.red, "Bear Effort Color", tooltip="Color of effort/efficiency labels when bears were the dominant aggressors (negative delta).\n\nNote: These labels use series colors (direction changes per bar), so they can only be configured here in Inputs, not in the Style tab.", group=effortGroup)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ DISPLAY ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+displayGroup = "Display"
+showControlBg = input.bool(false, title="Passive Absorption", tooltip="Detects chronic divergence — a.k.a. 'inversion chart' or limit-order-controlled market.\n\nWhen enabled, the background is colored when the Composite Operator appears to be controlling price through passive limit orders rather than aggressive market orders.\n\nThe color indicates that absorption is happening — check the red/green bulges on the Insights indicator to determine which side is being absorbed.\n\nTrust price direction more than CVD in these regimes.", group=displayGroup)
+passiveAbsorptionColor = input.color(color.new(color.orange, 92), "Passive Absorption Color", tooltip="Background color when chronic divergence (passive absorption / inversion chart) is detected.\n\nDefault: orange with high transparency.", group=displayGroup)
+showDeltaLabel = input.bool(false, "Show Bar Delta", tooltip="Displays the net volume delta value above each candle.\n\nGreen = net buying (positive delta)\nRed = net selling (negative delta)\n\nWhen footprint data is available, this shows the precise buy-sell delta.\nOtherwise it uses the standard CVD per-bar delta.\n\nUseful for reading raw aggressive pressure without smoothing.", group=displayGroup)
+deltaLabelSize = input.string("tiny", "Delta Label Size", options=["tiny", "small", "normal"], tooltip="Size of the delta labels above candles.", group=displayGroup)
+deltaLabelMinVol = input.float(0, "Delta Min Volume %", minval=0, maxval=500, tooltip="Only show delta labels on bars where volume exceeds this percentage of average volume.\n\n0 = show all bars.\n100 = only bars above average volume.\n\nReduces clutter by hiding delta on quiet bars.\nDefault: 0 (show all)", group=displayGroup)
+deltaBullColor = input.color(color.green, "Delta Buy Color", tooltip="Color of the bar delta label when net delta is positive (net buying).\n\nNote: These labels use series colors (direction changes per bar), so they can only be configured here in Inputs, not in the Style tab.", group=displayGroup)
+deltaBearColor = input.color(color.red, "Delta Sell Color", tooltip="Color of the bar delta label when net delta is negative (net selling).\n\nNote: These labels use series colors (direction changes per bar), so they can only be configured here in Inputs, not in the Style tab.", group=displayGroup)
+
+spikePocGroup = "Spike POC"
+showSpikePoc = input.bool(false, "Show Spike POC", tooltip="When a divergence spike is detected, draws a horizontal line at the Point of Control (POC) for that bar.\n\nIn Delta mode this is the Delta POC (DPOC) — the price level with the highest net delta concentration.\nIn Volume mode this is the Volume POC (VPOC) — the price level where the most volume traded.\n\nThis helps identify the exact price level where failed pressure accumulated — a potential support/resistance zone.", group=spikePocGroup)
+showSpikePocProfile = input.bool(false, "Show Spike Profile", tooltip="When enabled, draws a per-bin profile on each spike candle showing volume or delta distribution across price levels within the bar.", group=spikePocGroup)
+spikePocProfileMode = input.string("Delta", "Profile Mode", options=["Volume", "Delta"], tooltip="What data to display in the spike profile:\n\n• Volume: Total volume per price bin (like a standard Volume Profile). Brighter = more volume.\n\n• Delta: Net delta (buy minus sell volume) per price bin. Green bins = net buying, Red bins = net selling. Shows exactly where inside the spike bar the battle was fought.\n\nNote: Delta direction per sub-bar is approximated using close vs open, which is the standard method for retail platforms without tick-level bid/ask data.\n\nDefault: Delta", group=spikePocGroup)
+spikePocBins = input.int(20, "Price Bins", minval=5, maxval=50, tooltip="Number of price bins to divide the bar's range into for POC calculation.\n\nHigher = more precise but slower.\nDefault: 20", group=spikePocGroup)
+spikePocExtendLines = input.bool(true, "Extend Lines", tooltip="When enabled, POC lines extend until price crosses through them (the zone has been 'played').\n\nWhen disabled, POC lines are only 1 bar long, marking just the spike bar.", group=spikePocGroup)
+spikePocWidth = input.int(1, "POC Line Width", minval=1, maxval=10, tooltip="Thickness of the POC line.\n\nDefault: 1", group=spikePocGroup)
+spikePocBullColor = input.color(color.new(color.green, 50), "Bull Spike Color", tooltip="Color for POC lines and profile on bullish divergence spikes (failed bull pressure).\n\nNote: Line colors must be configured here in Inputs. Pine Script does not support Style tab configuration for dynamically drawn lines.", group=spikePocGroup)
+spikePocBearColor = input.color(color.new(color.red, 50), "Bear Spike Color", tooltip="Color for POC lines and profile on bearish divergence spikes (failed bear pressure).\n\nNote: Line colors must be configured here in Inputs. Pine Script does not support Style tab configuration for dynamically drawn lines.", group=spikePocGroup)
+spikeMerge = input.bool(true, "Merge Adjacent Spikes", tooltip="When enabled, adjacent spike bars are merged into a single cluster profile and POC.\n\nThis creates a unified volume/delta profile across the entire contested zone instead of separate profiles per spike bar.\n\nDefault: true", group=spikePocGroup)
+spikeMergeGap = input.int(1, "Merge Gap", minval=0, maxval=5, tooltip="Maximum number of non-spike bars allowed between spikes while still merging them into the same cluster.\n\n0 = only truly adjacent spikes merge.\n1 = one gap bar allowed (recommended).\n\nDefault: 1", group=spikePocGroup)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ BIG TRADES ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+bigTradesGroup = "Big Trades"
+showBigTrades = input.bool(false, "Show Big Trades", tooltip="Displays bubbles on the chart where large delta concentrations occurred within a bar.\n\nSimilar to 'Big Trades' indicators in professional order flow platforms (ATAS, Volumetrica, etc.), but approximated using lower timeframe delta distribution.\n\nGreen bubble = large net buying at that price level\nRed bubble = large net selling at that price level\nBubble size = relative magnitude of the delta\n\nNote: Delta direction per sub-bar is approximated using close vs open.", group=bigTradesGroup)
+bigTradesMode = input.string("Auto", "Threshold Mode", options=["Auto", "Manual"], tooltip="How to determine what counts as a 'big trade':\n\n• Auto: Shows the top X% of delta concentrations (set below). Works on any timeframe.\n\n• Manual: Uses a fixed delta threshold you specify.", group=bigTradesGroup)
+bigTradesAutoTopPct = input.float(10.0, "Auto: Top %", minval=1, maxval=50, tooltip="Show bubbles for the top X% of delta concentrations.\n\nE.g., 10 = show only bars in the top 10% of delta activity.\nLower = fewer, more significant bubbles.\nHigher = more bubbles.\n\nWorks on any timeframe (intraday, daily, weekly, etc.).\n\nDefault: 10", group=bigTradesGroup)
+bigTradesManualThreshold = input.float(1000, "Manual: Delta Threshold", minval=1, tooltip="Minimum absolute delta at a price level to trigger a bubble when in Manual mode.\n\nSet this based on the instrument you're trading — contracts for futures, shares for stocks, etc.", group=bigTradesGroup)
+bigTradesMinVolPct = input.float(80, "Min Volume %", minval=10, maxval=200, tooltip="Only check for big trades on bars where volume exceeds this percentage of average volume.\n\nThis optimization skips low-volume bars that are unlikely to contain big trades.\n\n100 = average volume, 80 = 80% of average.\nDefault: 80", group=bigTradesGroup)
+bigTradesBins = input.int(10, "Price Bins", minval=5, maxval=30, tooltip="Number of price bins to divide each bar into for delta calculation.\n\nLower = faster but less precise positioning.\nHigher = more precise but slower.\n\nDefault: 10", group=bigTradesGroup)
+bigTradesShowValue = input.bool(false, "Show Delta Value", tooltip="When enabled, displays the delta value inside each bubble instead of scaling bubble size.\n\nAll bubbles become the same size with a number showing the actual delta.", group=bigTradesGroup)
+bigTradesTransparency = input.int(50, "Transparency", minval=0, maxval=90, tooltip="Transparency of the bubbles.\n\n0 = fully opaque, 90 = nearly invisible.\nDefault: 50", group=bigTradesGroup)
+bigTradesBuyColor = input.color(color.green, "Buy Color", tooltip="Color for bubbles indicating net buying (positive delta).", group=bigTradesGroup)
+bigTradesSellColor = input.color(color.red, "Sell Color", tooltip="Color for bubbles indicating net selling (negative delta).", group=bigTradesGroup)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ MA CALCULATION ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+calc_hma(src, length) =>
+    len = math.max(length, 1)
+    half_length = int(len / 2)
+    sqrt_length = int(math.sqrt(len))
+    wma1 = ta.wma(src, half_length)
+    wma2 = ta.wma(src, len)
+    ta.wma(2 * wma1 - wma2, sqrt_length)
+
+calc_dema(src, length) =>
+    ema1 = ta.ema(src, length)
+    ema2 = ta.ema(ema1, length)
+    2 * ema1 - ema2
+
+calc_tema(src, length) =>
+    ema1 = ta.ema(src, length)
+    ema2 = ta.ema(ema1, length)
+    ema3 = ta.ema(ema2, length)
+    3 * ema1 - 3 * ema2 + ema3
+
+calc_zlema(src, length) =>
+    lag = int((length - 1) / 2)
+    data = src + (src - src[lag])
+    ta.ema(data, length)
+
+calc_lsma(src, length) =>
+    ta.linreg(src, length, 0)
+
+calc_alma(src, length) =>
+    ta.alma(src, length, 0.85, 6)
+
+calcMA(float src, int len) =>
+    float result = switch maTypeInput
+        "SMA" => ta.sma(src, len)
+        "EMA" => ta.ema(src, len)
+        "WMA" => ta.wma(src, len)
+        "RMA" => ta.rma(src, len)
+        "HMA" => calc_hma(src, len)
+        "DEMA" => calc_dema(src, len)
+        "TEMA" => calc_tema(src, len)
+        "ZLEMA" => calc_zlema(src, len)
+        "LSMA" => calc_lsma(src, len)
+        "SMMA" => ta.rma(src, len)
+        "ALMA" => calc_alma(src, len)
+        "SWMA" => ta.swma(src)
+        => ta.ema(src, len)
+    result
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ FOOTPRINT DATA REQUEST ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Request footprint data — GATED behind useFootprintInput.
+//
+// request.footprint() requires Premium or Ultimate plan. On lower-tier plans
+// it causes a script load error. In Pine v6, request.*() calls can execute
+// inside local scopes (dynamic requests). By wrapping it in an `if` block
+// gated by an input.bool (which has "input" qualifier — constant for the
+// entire script execution), the call never executes on plans where the user
+// hasn't opted in.
+//
+// Ticks per row is adaptive based on the instrument's tick size.
+// request.footprint() requires a "simple int" — no per-bar series allowed.
+//
+// Instruments with tiny ticks relative to price (like Gold: $0.01 tick at $3000)
+// produce huge row counts. We estimate this from syminfo fields.
+
+int chartSeconds = timeframe.in_seconds(timeframe.period)
+
+// Base ticks per row scaled by timeframe
+int fpBaseByTF = switch
+    chartSeconds >= 604800 => 5000   // Weekly+
+    chartSeconds >= 86400  => 2000   // Daily
+    chartSeconds >= 3600   => 500    // Hourly
+    chartSeconds >= 900    => 200    // 15m+
+    => 100                           // Below 15m
+
+// Scale factor based on tick granularity.
+// Tiny mintick (like 0.001 or 0.01) means many ticks per price unit = more rows.
+// We multiply the base by a factor to compensate.
+float tickScale = syminfo.mintick < 0.005 ? 5.0 : syminfo.mintick < 0.05 ? 3.0 : syminfo.mintick < 0.5 ? 2.0 : 1.0
+
+int fpTicksPerRow = int(math.round(fpBaseByTF * tickScale))
+
+// Footprint variables — populated only when useFootprintInput is true
+float fpDelta    = na
+float fpBuyVol   = na
+float fpSellVol  = na
+float fpTotalVol = na
+float fpPocUpper = na
+float fpPocLower = na
+float fpVahUpper = na
+float fpValLower = na
+bool  hasFootprint = false
+bool  useFootprint = false
+
+if useFootprintInput
+    footprint reqFootprint = request.footprint(fpTicksPerRow, 70)
+    if not na(reqFootprint)
+        hasFootprint := true
+        useFootprint := true
+        fpDelta    := reqFootprint.delta()
+        fpBuyVol   := reqFootprint.buy_volume()
+        fpSellVol  := reqFootprint.sell_volume()
+        fpTotalVol := reqFootprint.total_volume()
+        volume_row pocRow = reqFootprint.poc()
+        if not na(pocRow)
+            fpPocUpper := pocRow.up_price()
+            fpPocLower := pocRow.down_price()
+        volume_row vahRow = reqFootprint.vah()
+        if not na(vahRow)
+            fpVahUpper := vahRow.up_price()
+        volume_row valRow = reqFootprint.val()
+        if not na(valRow)
+            fpValLower := valRow.down_price()
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ CVD CORE ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Determine lower timeframe for LTF arrays (request.security_lower_tf)
+// and for the legacy CVD path (tvTa.requestVolumeDelta).
+//
+// IMPORTANT: We NEVER use "1S" (seconds) or "" (tick) here because
+// TradingView plan-gates these at script load time. Non-Premium users
+// get a fatal error even if the code path is unreachable at runtime.
+// The compiler sees the string literal and rejects the script.
+//
+// "1" (1-minute) is the finest safe resolution that works on all plans.
+// For Premium+ users who want finer data, footprint provides it natively.
+var lowerTimeframe = ""
+var legacyCvdTimeframe = ""
+
+if useCustomTimeframeInput
+    lowerTimeframe := lowerTimeframeInput
+    legacyCvdTimeframe := lowerTimeframeInput
+else
+    if timeframe.isseconds
+        // Already on a seconds-based chart — user must have the required plan
+        lowerTimeframe := "1S"
+        legacyCvdTimeframe := "1S"
+    else if timeframe.isintraday
+        lowerTimeframe := "1"
+        legacyCvdTimeframe := "1"
+    else if timeframe.isdaily
+        lowerTimeframe := "5"
+        legacyCvdTimeframe := "5"
+    else
+        lowerTimeframe := "60"
+        legacyCvdTimeframe := "60"
+
+// Legacy path: TradingView's ta library for volume delta
+// Uses legacyCvdTimeframe (safe — never "1S" unless already on seconds chart)
+[cvdOpen, cvdMax, cvdMin, cvdLast] = tvTa.requestVolumeDelta(legacyCvdTimeframe, anchorInput)
+
+// Select the per-bar delta source: footprint (precise) or legacy
+// fpDelta is the exact buy-sell delta for the bar.
+// cvdLast from tvTa is the accumulated CVD within the anchor period (or per-bar for chart anchor).
+float perBarDelta = useFootprint ? fpDelta : cvdLast
+
+// For data status detection — CVD is working if either path has data
+// (used internally, not displayed)
+
+// Accumulate CVD
+// All var declarations at global scope to avoid Pine scoping issues.
+var float cumVolLine = na
+var float cumulLastVolume = 0.0
+var float fpCumVol = 0.0
+
+if anchorInput == ""
+    // Chart-anchored mode: accumulate per-bar delta ourselves
+    // Both footprint and legacy paths use the same accumulation variable.
+    float deltaToAccum = useFootprint ? nz(fpDelta) : nz(cvdLast)
+    bool dataAppeared = useFootprint ? 
+         (not na(fpDelta) and na(fpDelta[1])) : 
+         (not na(cvdLast) and na(cvdLast[1]))
+    bool anchorChange = timeframe.change(timeframe.period) or dataAppeared
+    float cumulOpenVolume = anchorChange ? 0.0 : cumulLastVolume[1]
+    cumulLastVolume := cumulOpenVolume + deltaToAccum
+    cumVolLine := cumulLastVolume
+else
+    // HTF-anchored mode
+    if useFootprint
+        // Footprint: accumulate fpDelta across the anchor period
+        bool anchorChange = timeframe.change(anchorInput) or (not na(fpDelta) and na(fpDelta[1]))
+        fpCumVol := anchorChange ? nz(fpDelta) : fpCumVol + nz(fpDelta)
+        cumVolLine := fpCumVol
+    else
+        // Legacy: tvTa returns accumulated CVD within anchor period
+        cumVolLine := cvdLast
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ OSCILLATOR CALCULATION ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+float price_ma = calcMA(close, maLengthInput)
+float cvd_ma = calcMA(cumVolLine, maLengthInput)
+
+float cvd_ma_mean = calcMA(cvd_ma, maLengthInput)
+float cvd_ma_std = ta.stdev(cvd_ma, maLengthInput)
+float cvd_ma_norm = cvd_ma_std != 0 ? (cvd_ma - cvd_ma_mean) / cvd_ma_std : 0.0
+
+float price_ma_mean = calcMA(price_ma, maLengthInput)
+float price_ma_std = ta.stdev(price_ma, maLengthInput)
+float price_ma_norm = price_ma_std != 0 ? (price_ma - price_ma_mean) / price_ma_std : 0.0
+
+raw_oscillator = cvd_ma_norm - price_ma_norm
+
+// Volume weight — use footprint total volume if available for consistency
+float barVolume = useFootprint ? nz(fpTotalVol, volume) : volume
+vol_ma = calcMA(barVolume, oscLookback)
+volume_factor = nz(barVolume / vol_ma, 1.0)
+oscillator = useVolumeWeighting ? raw_oscillator * volume_factor : raw_oscillator
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ ABSORPTION CLOUD CALCULATION ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+float cloudATR = ta.atr(cloudAtrLength)
+
+float cloudPriceLine = price_ma + price_ma_norm * cloudATR * cloudScaleFactor
+float cloudCVDLine   = price_ma + cvd_ma_norm   * cloudATR * cloudScaleFactor
+
+color cloudFillColor = cloudCVDLine >= cloudPriceLine ? cloudBullColor : cloudBearColor
+
+priceLine = plot(showCloud ? cloudPriceLine : na, title="Cloud: Price Line", color=showCloud ? cloudLineColor : na, linewidth=1, style=plot.style_line, force_overlay=true, display=display.pane)
+cvdLine   = plot(showCloud ? cloudCVDLine : na,   title="Cloud: Pressure Line", color=showCloud ? cloudLineColor : na, linewidth=1, style=plot.style_line, force_overlay=true, display=display.pane)
+fill(priceLine, cvdLine, color=showCloud ? cloudFillColor : na, title="Absorption Cloud")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ PLOTS ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+oscColor = oscillator >= 0 ? bullOscColor : bearOscColor
+plot(oscillator, title='CVD Divergence Area', style=plot.style_area, color=oscColor)
+hline(0, 'Zero Line', color=color.gray, linestyle=hline.style_dashed)
+
+signalLine = ta.ema(oscillator, signalLength)
+plot(signalLine, title='Signal Line', color=color.blue, linewidth=1, display=display.none)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ DIVERGENCE SPIKE DETECTION ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+oscillator_weighted_signal = raw_oscillator * volume_factor
+
+osc_weighted_sma = ta.sma(oscillator_weighted_signal, oscLookback)
+osc_weighted_std = ta.stdev(oscillator_weighted_signal, oscLookback)
+divergence_spike = math.abs(oscillator_weighted_signal - osc_weighted_sma) > divergenceSpikeMultiplier * osc_weighted_std
+
+isBullishSpike = divergence_spike and oscillator_weighted_signal > 0
+isBearishSpike = divergence_spike and oscillator_weighted_signal < 0
+
+plotshape(isBullishSpike, title='Bullish Divergence Spike', location=location.top, style=shape.circle, size=size.tiny, color=color.green)
+plotshape(isBearishSpike, title='Bearish Divergence Spike', location=location.bottom, style=shape.circle, size=size.tiny, color=color.red)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ LOWER TIMEFRAME DATA ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// LTF arrays are used for spatial profiles and Big Trades.
+// When footprint IS available, we use its native POC for spike POC lines
+// but still need LTF for the full profile visualization (footprint volume_row
+// iteration is not yet available in Pine — we only get POC/VAH/VAL rows).
+//
+// lowerTimeframe is always safe (never "1S" or "" on non-seconds charts)
+// so request.security_lower_tf() will not cause plan-gating errors.
+ltfHighArray  = request.security_lower_tf(syminfo.tickerid, lowerTimeframe, high)
+ltfLowArray   = request.security_lower_tf(syminfo.tickerid, lowerTimeframe, low)
+ltfVolArray   = request.security_lower_tf(syminfo.tickerid, lowerTimeframe, volume)
+ltfOpenArray  = request.security_lower_tf(syminfo.tickerid, lowerTimeframe, open)
+ltfCloseArray = request.security_lower_tf(syminfo.tickerid, lowerTimeframe, close)
+
+// Track active POC lines for "extend lines" feature
+var array<line> activePocLines = array.new_line()
+var array<float> activePocPrices = array.new_float()
+
+// Check if price crossed any active POC lines and end them
+if showSpikePoc and spikePocExtendLines and array.size(activePocLines) > 0
+    int i = array.size(activePocLines) - 1
+    while i >= 0
+        float pocLvl = array.get(activePocPrices, i)
+        bool crossed = low <= pocLvl and high >= pocLvl
+        if crossed
+            line ln = array.get(activePocLines, i)
+            line.set_x2(ln, bar_index)
+            array.remove(activePocLines, i)
+            array.remove(activePocPrices, i)
+        i -= 1
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ SPIKE POC — DRAWING (with cluster merge support) ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool isSpike = isBullishSpike or isBearishSpike
+
+// --- Cluster tracking state ---
+var array<float> clusterHighs = array.new_float()
+var array<float> clusterLows  = array.new_float()
+var array<float> clusterVols  = array.new_float()
+var array<float> clusterOpens = array.new_float()
+var array<float> clusterCloses = array.new_float()
+var float clusterHigh = na
+var float clusterLow  = na
+var int clusterStartBar = na
+var int clusterLastSpikeBar = na
+var int clusterBullCount = 0
+var int clusterBearCount = 0
+var bool clusterPending = false
+var bool clusterIsBull = true
+
+// When footprint is available, also track native POC prices per cluster
+// for a more accurate merged POC (weighted by footprint delta)
+var array<float> clusterFpPocPrices = array.new_float()
+var array<float> clusterFpPocDeltas = array.new_float()
+
+drawClusterProfile(clH, clL, clStartBar, clLastBar, bullCount, bearCount, clHighs, clLows, clVols, clOpens, clCloses, numBins, profileMode, showProfile, showPoc, extendLines, pocWidth, bullColor, bearColor, pocLines, pocPrices, fpPocPrices, fpPocDeltas) =>
+    bool isBullCluster = bullCount >= bearCount
+    color cPocColor = isBullCluster ? bullColor : bearColor
+    
+    float cRange = clH - clL
+    if cRange > 0 and array.size(clHighs) > 0
+        float binSize = cRange / numBins
+        float[] mVolBins = array.new_float(numBins, 0.0)
+        float[] mDeltaBins = array.new_float(numBins, 0.0)
+        
+        int numSubs = array.size(clHighs)
+        for i = 0 to numSubs - 1
+            float subHigh  = array.get(clHighs, i)
+            float subLow   = array.get(clLows, i)
+            float subVol   = array.get(clVols, i)
+            float subOpen  = array.get(clOpens, i)
+            float subClose = array.get(clCloses, i)
+            
+            if subVol > 0
+                float subDelta = subClose >= subOpen ? subVol : -subVol
+                
+                int startBin = int((subLow - clL) / binSize)
+                int endBin   = int((subHigh - clL) / binSize)
+                startBin := math.max(0, math.min(numBins - 1, startBin))
+                endBin   := math.max(0, math.min(numBins - 1, endBin))
+                int binsSpanned = endBin - startBin + 1
+                
+                float subMid = (subHigh + subLow) / 2.0
+                if binsSpanned <= 2
+                    float midP = math.max(clL, math.min(clH - syminfo.mintick, subMid))
+                    int binIdx = math.max(0, math.min(numBins - 1, int((midP - clL) / binSize)))
+                    array.set(mVolBins, binIdx, array.get(mVolBins, binIdx) + subVol)
+                    array.set(mDeltaBins, binIdx, array.get(mDeltaBins, binIdx) + subDelta)
+                else
+                    float subRange = subHigh - subLow
+                    for b = startBin to endBin
+                        float bLow  = clL + b * binSize
+                        float bHigh = clL + (b + 1) * binSize
+                        float oLow  = math.max(subLow, bLow)
+                        float oHigh = math.min(subHigh, bHigh)
+                        float oSize = math.max(0.0, oHigh - oLow)
+                        float frac  = subRange > 0 ? oSize / subRange : 0.0
+                        array.set(mVolBins, b, array.get(mVolBins, b) + subVol * frac)
+                        array.set(mDeltaBins, b, array.get(mDeltaBins, b) + subDelta * frac)
+        
+        float mMaxVol = 0.0
+        float mMaxAbsDelta = 0.0
+        int volPocBin = 0
+        int deltaPocBin = 0
+        for i = 0 to numBins - 1
+            float bv = array.get(mVolBins, i)
+            if bv > mMaxVol
+                mMaxVol := bv
+                volPocBin := i
+            float ad = math.abs(array.get(mDeltaBins, i))
+            if ad > mMaxAbsDelta
+                mMaxAbsDelta := ad
+                deltaPocBin := i
+        
+        if showProfile
+            float gap = binSize * 0.08
+            for i = 0 to numBins - 1
+                float binLow  = clL + i * binSize + gap
+                float binHigh = clL + (i + 1) * binSize - gap
+                
+                if profileMode == "Delta"
+                    float binDelta = array.get(mDeltaBins, i)
+                    if binDelta != 0
+                        float mag = math.abs(binDelta) / mMaxAbsDelta
+                        int transp = int(math.round(85 - mag * 70))
+                        color bColor = binDelta > 0 ? color.new(color.green, transp) : color.new(color.red, transp)
+                        box.new(clStartBar, binHigh, clLastBar + 1, binLow,
+                             border_color=na, bgcolor=bColor, force_overlay=true)
+                else
+                    float binVol = array.get(mVolBins, i)
+                    if binVol > 0
+                        float wr = binVol / mMaxVol
+                        int transp = int(math.round(85 - wr * 70))
+                        color bColor = isBullCluster ? color.new(bullColor, transp) : color.new(bearColor, transp)
+                        box.new(clStartBar, binHigh, clLastBar + 1, binLow,
+                             border_color=na, bgcolor=bColor, force_overlay=true)
+        
+        if showPoc
+            // Determine POC price:
+            // If footprint data was collected for this cluster, use the
+            // delta-weighted average of native footprint POCs (more accurate).
+            // Otherwise, fall back to the LTF-based profile POC.
+            float finalPoc = na
+            color finalPocColor = cPocColor
+            
+            if array.size(fpPocPrices) > 0
+                // Weighted average of footprint POC prices by absolute delta
+                float sumWeightedPrice = 0.0
+                float sumWeight = 0.0
+                float netDelta = 0.0
+                for i = 0 to array.size(fpPocPrices) - 1
+                    float p = array.get(fpPocPrices, i)
+                    float d = array.get(fpPocDeltas, i)
+                    float w = math.abs(d)
+                    sumWeightedPrice += p * w
+                    sumWeight += w
+                    netDelta += d
+                finalPoc := sumWeight > 0 ? sumWeightedPrice / sumWeight : (clH + clL) / 2.0
+                // Color by net delta direction at the POC
+                if profileMode == "Delta"
+                    finalPocColor := netDelta >= 0 ? bullColor : bearColor
+            else
+                // Legacy LTF-based POC
+                int pocBin = profileMode == "Delta" and mMaxAbsDelta > 0 ? deltaPocBin : volPocBin
+                finalPoc := clL + (pocBin + 0.5) * binSize
+                if profileMode == "Delta" and mMaxAbsDelta > 0
+                    float pocDelta = array.get(mDeltaBins, pocBin)
+                    finalPocColor := pocDelta >= 0 ? bullColor : bearColor
+            
+            int startX = clStartBar
+            int endX = extendLines ? last_bar_index : clLastBar + 1
+            
+            line newLine = line.new(startX, finalPoc, endX, finalPoc,
+                     color=finalPocColor, width=pocWidth, style=line.style_solid, force_overlay=true)
+            
+            if extendLines
+                array.push(pocLines, newLine)
+                array.push(pocPrices, finalPoc)
+
+// --- Main per-bar logic ---
+
+if showSpikePoc or showSpikePocProfile
+    bool mergeEnabled = spikeMerge
+    int gapAllowed = spikeMergeGap
+    
+    if isSpike
+        bool thisSpikeIsBull = isBullishSpike
+        
+        if clusterPending and mergeEnabled and (thisSpikeIsBull != clusterIsBull)
+            drawClusterProfile(clusterHigh, clusterLow, clusterStartBar, clusterLastSpikeBar,
+                 clusterBullCount, clusterBearCount, clusterHighs, clusterLows, clusterVols,
+                 clusterOpens, clusterCloses,
+                 spikePocBins, spikePocProfileMode, showSpikePocProfile, showSpikePoc,
+                 spikePocExtendLines, spikePocWidth, spikePocBullColor, spikePocBearColor,
+                 activePocLines, activePocPrices, clusterFpPocPrices, clusterFpPocDeltas)
+            array.clear(clusterHighs)
+            array.clear(clusterLows)
+            array.clear(clusterVols)
+            array.clear(clusterOpens)
+            array.clear(clusterCloses)
+            array.clear(clusterFpPocPrices)
+            array.clear(clusterFpPocDeltas)
+            clusterHigh := na
+            clusterLow  := na
+            clusterStartBar := na
+            clusterLastSpikeBar := na
+            clusterBullCount := 0
+            clusterBearCount := 0
+            clusterPending := false
+        
+        // Add this bar's LTF data to the cluster (still needed for profile viz)
+        int numSubs = array.size(ltfHighArray)
+        if numSubs > 0
+            for i = 0 to numSubs - 1
+                array.push(clusterHighs, math.min(array.get(ltfHighArray, i), high))
+                array.push(clusterLows, math.max(array.get(ltfLowArray, i), low))
+                array.push(clusterVols, array.get(ltfVolArray, i))
+                array.push(clusterOpens, array.get(ltfOpenArray, i))
+                array.push(clusterCloses, array.get(ltfCloseArray, i))
+        
+        // If footprint is available, collect native POC for this spike bar
+        // Use bar-level fpDelta as weight (reflects overall bar significance)
+        if useFootprint and not na(fpPocUpper) and not na(fpPocLower) and not na(fpDelta)
+            float fpPocMid = (fpPocUpper + fpPocLower) / 2.0
+            array.push(clusterFpPocPrices, fpPocMid)
+            array.push(clusterFpPocDeltas, fpDelta)
+        
+        clusterHigh := na(clusterHigh) ? high : math.max(clusterHigh, high)
+        clusterLow  := na(clusterLow)  ? low  : math.min(clusterLow, low)
+        if na(clusterStartBar)
+            clusterStartBar := bar_index
+            clusterIsBull := thisSpikeIsBull
+        clusterLastSpikeBar := bar_index
+        if isBullishSpike
+            clusterBullCount += 1
+        if isBearishSpike
+            clusterBearCount += 1
+        clusterPending := true
+        
+        if not mergeEnabled
+            drawClusterProfile(clusterHigh, clusterLow, clusterStartBar, clusterLastSpikeBar,
+                 clusterBullCount, clusterBearCount, clusterHighs, clusterLows, clusterVols,
+                 clusterOpens, clusterCloses,
+                 spikePocBins, spikePocProfileMode, showSpikePocProfile, showSpikePoc,
+                 spikePocExtendLines, spikePocWidth, spikePocBullColor, spikePocBearColor,
+                 activePocLines, activePocPrices, clusterFpPocPrices, clusterFpPocDeltas)
+            array.clear(clusterHighs)
+            array.clear(clusterLows)
+            array.clear(clusterVols)
+            array.clear(clusterOpens)
+            array.clear(clusterCloses)
+            array.clear(clusterFpPocPrices)
+            array.clear(clusterFpPocDeltas)
+            clusterHigh := na
+            clusterLow  := na
+            clusterStartBar := na
+            clusterLastSpikeBar := na
+            clusterBullCount := 0
+            clusterBearCount := 0
+            clusterPending := false
+    
+    else if clusterPending and mergeEnabled
+        int barsSinceLastSpike = bar_index - nz(clusterLastSpikeBar, 0)
+        if barsSinceLastSpike > gapAllowed
+            drawClusterProfile(clusterHigh, clusterLow, clusterStartBar, clusterLastSpikeBar,
+                 clusterBullCount, clusterBearCount, clusterHighs, clusterLows, clusterVols,
+                 clusterOpens, clusterCloses,
+                 spikePocBins, spikePocProfileMode, showSpikePocProfile, showSpikePoc,
+                 spikePocExtendLines, spikePocWidth, spikePocBullColor, spikePocBearColor,
+                 activePocLines, activePocPrices, clusterFpPocPrices, clusterFpPocDeltas)
+            array.clear(clusterHighs)
+            array.clear(clusterLows)
+            array.clear(clusterVols)
+            array.clear(clusterOpens)
+            array.clear(clusterCloses)
+            array.clear(clusterFpPocPrices)
+            array.clear(clusterFpPocDeltas)
+            clusterHigh := na
+            clusterLow  := na
+            clusterStartBar := na
+            clusterLastSpikeBar := na
+            clusterBullCount := 0
+            clusterBearCount := 0
+            clusterPending := false
+    
+    if clusterPending and barstate.islast
+        drawClusterProfile(clusterHigh, clusterLow, clusterStartBar, clusterLastSpikeBar,
+             clusterBullCount, clusterBearCount, clusterHighs, clusterLows, clusterVols,
+             clusterOpens, clusterCloses,
+             spikePocBins, spikePocProfileMode, showSpikePocProfile, showSpikePoc,
+             spikePocExtendLines, spikePocWidth, spikePocBullColor, spikePocBearColor,
+             activePocLines, activePocPrices, clusterFpPocPrices, clusterFpPocDeltas)
+        array.clear(clusterHighs)
+        array.clear(clusterLows)
+        array.clear(clusterVols)
+        array.clear(clusterOpens)
+        array.clear(clusterCloses)
+        array.clear(clusterFpPocPrices)
+        array.clear(clusterFpPocDeltas)
+        clusterHigh := na
+        clusterLow  := na
+        clusterStartBar := na
+        clusterLastSpikeBar := na
+        clusterBullCount := 0
+        clusterBearCount := 0
+        clusterPending := false
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ BIG TRADES CALCULATION ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+calcBarMaxDelta(barHigh, barLow, numBins, ltfHighs, ltfLows, ltfVols, ltfOpens, ltfCloses) =>
+    float maxDeltaPrice = (barHigh + barLow) / 2.0
+    float maxDelta = 0.0
+    bool isBuy = true
+    
+    if barHigh > barLow and array.size(ltfHighs) > 0
+        float barRange = barHigh - barLow
+        float binSize = barRange / numBins
+        float[] deltaBins = array.new_float(numBins, 0.0)
+        
+        int numSubBars = array.size(ltfHighs)
+        
+        for i = 0 to numSubBars - 1
+            float subHigh  = math.min(array.get(ltfHighs, i), barHigh)
+            float subLow   = math.max(array.get(ltfLows, i), barLow)
+            float subVol   = array.get(ltfVols, i)
+            float subOpen  = array.get(ltfOpens, i)
+            float subClose = array.get(ltfCloses, i)
+            
+            if subVol > 0
+                float subDelta = subClose >= subOpen ? subVol : -subVol
+                
+                float subMid = (subHigh + subLow) / 2.0
+                float midPrice = math.max(barLow, math.min(barHigh - syminfo.mintick, subMid))
+                int binIndex = int((midPrice - barLow) / binSize)
+                binIndex := math.max(0, math.min(numBins - 1, binIndex))
+                array.set(deltaBins, binIndex, array.get(deltaBins, binIndex) + subDelta)
+        
+        float maxAbsDelta = 0.0
+        int maxBin = 0
+        for i = 0 to numBins - 1
+            float absDelta = math.abs(array.get(deltaBins, i))
+            if absDelta > maxAbsDelta
+                maxAbsDelta := absDelta
+                maxBin := i
+                maxDelta := array.get(deltaBins, i)
+        
+        maxDeltaPrice := barLow + (maxBin + 0.5) * binSize
+        isBuy := maxDelta >= 0
+    
+    [maxDeltaPrice, maxDelta, isBuy]
+
+// Big Trades always uses the legacy LTF binning approach, even when footprint
+// is available. The footprint API doesn't expose row iteration, so we can't
+// scan for the price level with the highest delta concentration. The LTF
+// sub-bar binning does exactly this — it finds where within the bar the
+// largest aggressive trade occurred, which is the whole point of Big Trades.
+// Footprint data is used for CVD, oscillator, effort score, etc. — just not here.
+
+int bigTradesLookback = 500
+float bigTradesAvgVol = ta.sma(barVolume, bigTradesLookback)
+bool bigTradesVolFilter = barVolume >= (bigTradesAvgVol * bigTradesMinVolPct / 100.0)
+
+float barMaxDelta = na
+float barMaxDeltaPrice = na
+bool barMaxDeltaIsBuy = true
+
+if bigTradesVolFilter and array.size(ltfHighArray) > 0
+    [deltaPrice, deltaVal, deltaBuy] = calcBarMaxDelta(high, low, bigTradesBins, ltfHighArray, ltfLowArray, ltfVolArray, ltfOpenArray, ltfCloseArray)
+    barMaxDeltaPrice := deltaPrice
+    barMaxDelta := math.abs(deltaVal)
+    barMaxDeltaIsBuy := deltaBuy
+
+float maxDeltaForPercentile = nz(barMaxDelta, 0)
+
+float targetPercentile = 100.0 - bigTradesAutoTopPct
+float autoThreshold = ta.percentile_linear_interpolation(maxDeltaForPercentile, bigTradesLookback, targetPercentile)
+
+float bigTradesThreshold = bigTradesMode == "Auto" ? autoThreshold : bigTradesManualThreshold
+
+// Format large numbers without sign (for Big Trades where color = direction)
+formatCompactUnsigned(float val) =>
+    float absVal = math.abs(val)
+    string suffix = ""
+    float scaled = absVal
+    if absVal >= 1000000000
+        scaled := math.round(absVal / 1000000000, 1)
+        suffix := "B"
+    else if absVal >= 1000000
+        scaled := math.round(absVal / 1000000, 1)
+        suffix := "M"
+    else if absVal >= 1000
+        scaled := math.round(absVal / 1000, 1)
+        suffix := "K"
+    else
+        scaled := math.round(absVal)
+    str.tostring(scaled) + suffix
+
+if showBigTrades and (barstate.ishistory or barstate.isconfirmed) and not na(barMaxDelta)
+    if barMaxDelta >= bigTradesThreshold and bigTradesThreshold > 0
+        color bubbleColor = color.new(barMaxDeltaIsBuy ? bigTradesBuyColor : bigTradesSellColor, bigTradesTransparency)
+        
+        if bigTradesShowValue
+            string deltaText = formatCompactUnsigned(barMaxDelta)
+            label.new(bar_index, barMaxDeltaPrice, deltaText, 
+                 style=label.style_label_center, color=bubbleColor, textcolor=color.white, size=size.small,
+                 force_overlay=true)
+        else
+            float deltaRatio = math.min(barMaxDelta / bigTradesThreshold, 5.0)
+            
+            string bubbleSize = switch
+                deltaRatio >= 4.0 => size.huge
+                deltaRatio >= 2.5 => size.large
+                deltaRatio >= 1.5 => size.normal
+                deltaRatio >= 1.2 => size.small
+                => size.tiny
+            
+            label.new(bar_index, barMaxDeltaPrice, "", 
+                 style=label.style_circle, color=bubbleColor, size=bubbleSize,
+                 force_overlay=true)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ EFFORT SCORE CALCULATION ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// When footprint is available, use its precise delta for effort calculation
+// instead of a separate tvTa.requestVolumeDelta() call.
+// Legacy path uses legacyCvdTimeframe (safe — no "1S" crash on lower plans).
+[_evdOpen, _evdMax, _evdMin, effortDeltaLegacy] = tvTa.requestVolumeDelta(legacyCvdTimeframe)
+
+// Select effort delta source: footprint (precise) or legacy
+float effortDelta = useFootprint ? fpDelta : effortDeltaLegacy
+
+float avgVol = ta.sma(barVolume, effortLookback)
+float volWeight = avgVol != 0 ? barVolume / avgVol : 1.0
+float rawEffort = nz(effortDelta) * volWeight
+
+float absEffort = math.abs(rawEffort)
+float effortPctRank = ta.percentrank(absEffort, effortLookback)
+float effortScore = rawEffort >= 0 ? effortPctRank : -effortPctRank
+int effortDisplay = int(math.round(effortScore))
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ EFFICIENCY RATIO CALCULATION ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+float priceResult = close - close[1]
+float absPriceChange = math.abs(priceResult)
+float resultPctRank = ta.percentrank(absPriceChange, effortLookback)
+
+bool isAligned = (rawEffort >= 0 and priceResult >= 0) or (rawEffort < 0 and priceResult < 0)
+
+float efficiencyRaw = effortPctRank > 0 ? (resultPctRank / effortPctRank) * 100.0 : 0.0
+float efficiencySigned = isAligned ? efficiencyRaw : -efficiencyRaw
+int efficiencyDisplay = int(math.max(math.min(math.round(efficiencySigned), 999), -999))
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ EFFORT SCORE DISPLAY ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+float effortOffset = ta.atr(14) * 0.5
+
+if showEffortScore and barstate.isconfirmed and math.abs(effortDisplay) >= effortMinDisplay
+    color labelColor = effortDisplay > 0 ? effortBullColor : effortBearColor
+
+    string lblSize = switch effortLabelSize
+        "tiny" => size.tiny
+        "small" => size.small
+        "normal" => size.normal
+        => size.small
+
+    string labelText = str.tostring(math.abs(effortDisplay)) + "\n" + str.tostring(efficiencyDisplay) + "%"
+    label.new(bar_index, low - effortOffset, labelText, style=label.style_none, textcolor=labelColor, size=lblSize, force_overlay=true)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ BAR DELTA LABEL ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Format large numbers with K/M/B suffixes
+formatCompact(float val) =>
+    float absVal = math.abs(val)
+    string prefix = val >= 0 ? "+" : "-"
+    string suffix = ""
+    float scaled = absVal
+    if absVal >= 1000000000
+        scaled := math.round(absVal / 1000000000, 1)
+        suffix := "B"
+    else if absVal >= 1000000
+        scaled := math.round(absVal / 1000000, 1)
+        suffix := "M"
+    else if absVal >= 1000
+        scaled := math.round(absVal / 1000, 1)
+        suffix := "K"
+    else
+        scaled := math.round(absVal)
+    prefix + str.tostring(scaled) + suffix
+
+// Display the net volume delta value above each candle.
+// Uses footprint delta when available (precise), otherwise the per-bar CVD delta.
+float deltaLabelAvgVol = ta.sma(barVolume, 100)
+bool deltaLabelVolFilter = deltaLabelMinVol <= 0 or barVolume >= (deltaLabelAvgVol * deltaLabelMinVol / 100.0)
+float deltaOffset = ta.atr(14) * 0.3
+
+if showDeltaLabel and barstate.isconfirmed and deltaLabelVolFilter
+    // Use footprint delta when available (precise per-bar delta).
+    // Legacy fallback: effortDeltaLegacy is from tvTa.requestVolumeDelta
+    // WITHOUT an anchor period, so it's true per-bar delta.
+    // perBarDelta would be wrong here when anchorInput is a HTF because
+    // cvdLast is accumulated across the anchor period, not a single bar.
+    float barDeltaValue = useFootprint ? fpDelta : nz(effortDeltaLegacy)
+    
+    if not na(barDeltaValue) and barDeltaValue != 0
+        color deltaColor = barDeltaValue > 0 ? deltaBullColor : deltaBearColor
+        
+        string dLblSize = switch deltaLabelSize
+            "tiny" => size.tiny
+            "small" => size.small
+            "normal" => size.normal
+            => size.tiny
+        
+        string deltaStr = formatCompact(barDeltaValue)
+        
+        label.new(bar_index, high + deltaOffset, deltaStr, 
+             style=label.style_none, textcolor=deltaColor, size=dLblSize, 
+             force_overlay=true)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ PASSIVE ABSORPTION BACKGROUND ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Detect chronic divergence by checking if the oscillator is persistently one-sided.
+// The oscillator already measures the gap between CVD and price.
+// When it stays negative (red) for an extended period, bears are chronically absorbed.
+// When it stays positive (green) for an extended period, bulls are chronically absorbed.
+//
+// Scoring: each bar's oscillator sign gets scored ±1, then smoothed.
+// A high |average| means the oscillator rarely crosses zero — chronic divergence.
+
+float paScore = raw_oscillator > 0 ? 1.0 : raw_oscillator < 0 ? -1.0 : 0.0
+float paSmoothed = ta.sma(paScore, maLengthInput * 2)
+
+// Threshold: |paSmoothed| > 0.6 means ~80% of bars in the window are same-signed
+newBgColor = math.abs(paSmoothed) > 0.6 ? passiveAbsorptionColor : na
+
+bgcolor(showControlBg ? newBgColor : na, title='Passive Absorption')
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ INFO LABEL ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+int chartTFSeconds = timeframe.in_seconds(timeframe.period)
+int lowerTFSeconds = lowerTimeframe == "1S" ? 1 : timeframe.in_seconds(lowerTimeframe)
+
+float granularityRatio = lowerTFSeconds > 0 ? chartTFSeconds / lowerTFSeconds : 0.0
+
+// Compact single-cell table in the bottom-right corner of the indicator pane
+var table infoTable = na
+
+if showInfoInput
+    if na(infoTable)
+        infoTable := table.new(position.bottom_right, 1, 1, bgcolor=color.new(#2962FF, 0), border_width=0)
+
+    if barstate.islast
+        string infoText = na
+        
+        if useFootprint
+            infoText := "FP ✓"
+        else
+            string tfDisplay = lowerTimeframe
+            string ratioText = str.tostring(math.round(granularityRatio))
+            infoText := tfDisplay + " · " + ratioText + "x"
+        
+        table.cell(infoTable, 0, 0, infoText, text_color=color.white, text_size=size.small, bgcolor=color.new(#2962FF, 0))
+else if not na(infoTable)
+    table.delete(infoTable)
+    infoTable := na
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ ERROR HANDLING ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+var cumVol = 0.
+cumVol += nz(volume)
+if barstate.islast and cumVol == 0
+    runtime.error("The data vendor doesn't provide volume data for this symbol.")
